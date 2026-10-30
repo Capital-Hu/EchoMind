@@ -231,6 +231,8 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    problem_record: Dict[str, Any] = Field(default_factory=dict)
+    problem_record_error: str = ""
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -269,19 +271,32 @@ async def chat(req: ChatRequest):
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
+    conv_id = req.conv_id or str(uuid.uuid4())
+    async with _memory.conversation_lock(req.user_id, conv_id):
+        return await _chat_turn(req, conv_id)
+
+
+async def _chat_turn(req: ChatRequest, conv_id: str) -> ChatResponse:
     from agents.agent_orchestrator import Request as OrcReq
     from memory.conversation_memory import MsgRole
-
-    conv_id = req.conv_id or str(uuid.uuid4())
+    from memory.problem_record import render_problem_record
 
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    prepared = await _memory.problem_records.prepare(
+        req.user_id, conv_id, req.message,
+        [{"role": m.role.value, "content": m.content} for m in mem_ctx.recent_messages[-4:]],
+    )
+    mem_ctx.problem_record = prepared.record
 
     # 2. 构建编排请求（含对话历史，用于意图识别上下文）
     history = [
         {"role": m.role.value, "content": m.content}
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
+    if prepared.record:
+        # 识别短续接消息时，也知道当前正在处理的问题；不是历史用户原话。
+        history = [{"role": "system", "content": render_problem_record(prepared.record)}] + (history or [])[-2:]
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
@@ -305,6 +320,10 @@ async def chat(req: ChatRequest):
 
     # 3. 执行
     result = await _orchestrator.run(orch_req)
+    recorded = await _memory.problem_records.finish(
+        req.user_id, conv_id, prepared.record, result.response, result.agent_type.value,
+        [agent.value for agent in result.agent_types],
+    )
 
     # 4. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
@@ -330,7 +349,21 @@ async def chat(req: ChatRequest):
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        problem_record=recorded.record,
+        problem_record_error=prepared.error or recorded.error,
     )
+
+
+@app.get("/memory/problems", tags=["Memory"])
+async def problem_records(user_id: str, conv_id: str):
+    """查看同一用户同一会话的问题处理记录，包含已切换的旧问题。"""
+    if _memory is None:
+        raise HTTPException(503, "服务未就绪")
+    try:
+        records = await asyncio.to_thread(_memory.problem_records.store.list, user_id, conv_id)
+    except Exception:
+        raise HTTPException(503, "问题处理记录暂时无法读取")
+    return {"records": records}
 
 
 async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
@@ -630,17 +663,31 @@ async def _cli():
             break
 
         ctx = await mem.get_context(user_id, conv_id, query=msg)
+        prepared = await mem.problem_records.prepare(
+            user_id, conv_id, msg,
+            [{"role": m.role.value, "content": m.content} for m in ctx.recent_messages[-4:]],
+        )
+        ctx.problem_record = prepared.record
         history = [
             {"role": m.role.value, "content": m.content}
             for m in ctx.recent_messages[-5:]
         ] if ctx.recent_messages else None
+        if prepared.record:
+            from memory.problem_record import render_problem_record
+            history = [{"role": "system", "content": render_problem_record(prepared.record)}] + (history or [])[-2:]
         req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
         result = await orch.run(req)
+        recorded = await mem.problem_records.finish(
+            user_id, conv_id, prepared.record, result.response, result.agent_type.value,
+            [agent.value for agent in result.agent_types],
+        )
 
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
         print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+        if prepared.error or recorded.error:
+            print(f"处理记录：{prepared.error or recorded.error}\n")
 
     await mem.close()
 

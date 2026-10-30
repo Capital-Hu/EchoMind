@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
@@ -26,6 +27,7 @@ import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content, get_max_tokens
+from memory.problem_record import ProblemRecordManager, render_problem_record
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class MemoryContext:
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
     user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
     summary:          str             # 当前会话摘要（压缩后）
+    problem_record: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -66,6 +69,8 @@ class MemoryContext:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
             parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+        if self.problem_record:
+            parts.append(render_problem_record(self.problem_record))
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages:
@@ -105,6 +110,11 @@ class MemoryManager:
         # 锁覆盖同一服务进程内的写入和压缩；画像按用户串行合并。
         self._locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._profile_locks: Dict[str, asyncio.Lock] = {}
+        self._turn_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        # 复用现有持久化目录；记录独立保存，不随 Redis 过期或摘要压缩而丢失。
+        self.problem_records = ProblemRecordManager(
+            str(Path(chroma_path) / "problem_records.sqlite3"), self._client, self._model,
+        )
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
 
@@ -401,6 +411,10 @@ class MemoryManager:
 
     def _lock_for(self, user_id: str, conv_id: str) -> asyncio.Lock:
         return self._locks.setdefault((user_id, conv_id), asyncio.Lock())
+
+    def conversation_lock(self, user_id: str, conv_id: str) -> asyncio.Lock:
+        """同一进程内整轮处理串行，避免问题记录更新互相覆盖。"""
+        return self._turn_locks.setdefault((user_id, conv_id), asyncio.Lock())
 
     @staticmethod
     def _profile_doc_id(user_id: str) -> str:

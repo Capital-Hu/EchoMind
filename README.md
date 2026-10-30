@@ -22,6 +22,7 @@ EchoMind/
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
 ├── memory/conversation_memory.py  # Redis + ChromaDB 记忆管理
+├── memory/problem_record.py       # 按问题保存用户反馈、已尝试方法及接手 Agent
 ├── mcp/tool_manager.py            # MCP 工具调用、查询改写、重排、熔断、缓存、降级
 ├── mcp/knowledge_base.py          # ChromaDB RAG 知识库
 ├── monitor/performance_monitor.py # Agent/工具在线监控
@@ -70,7 +71,8 @@ CLAUDE_MAX_TOKENS=4096
 ```
 
 意图识别、查询改写、检索重排、用户画像、摘要生成与合并、Agent 回复和评测均使用
-这个值。它只控制输出额度，思考模式仍沿用当前模型设置；摘要最终仍限制在 800 字内。
+这个值，问题处理记录的提取也共用此配置。它只控制输出额度，思考模式仍沿用当前
+模型设置；摘要最终仍限制在 800 字内。
 
 修改 `.env` 后，本地运行需重新启动后端进程。Docker Compose 需重新创建应用容器
 以加载新环境变量，仅执行 `docker compose restart` 不会重新读取 `.env`：
@@ -989,6 +991,44 @@ TTL wm:user_001:session_001
 默认 TTL 是 24 小时。
 
 ## 11. 查看工作记忆压缩内容
+
+### 通用问题处理记录
+
+API 和 CLI 在每次回答前，会读取当前问题记录，并用本轮用户消息更新它。
+该步骤独立调用一次模型，判断是在继续当前问题、提出新问题，还是仅闲聊。
+记录包括问题标题、处理状态、用户报告的信息、已尝试的方法与结果、反馈、
+未解决事项、下一步待办和接手过的 Agent；所有 Agent 共用这份上下文。
+
+用户“试过了但无效”和客服“建议尝试”分开保存，用户信息和已做步骤必须附带
+来自本轮用户原话的引用。上一轮客服建议只从实际展示的回复中提取，不作为已执行
+操作。`resolved` 表示用户反馈问题已解决；`handoff_requested` 只表示用户请求人工，
+不代表已真正接通人工。退款到账等业务结果也不能由处理记录证明。
+
+切换到独立问题时创建新记录，旧问题仍保留；同一用户同一会话整轮串行处理。
+记录写在现有 `CHROMA_PERSIST_DIRECTORY` 下独立的 `problem_records.sqlite3` 文件中，
+复用已有数据挂载，无需新增依赖或环境变量。它不依赖 Redis 的 24 小时有效期，
+也不会因聊天原文压缩而删除。每类明细最多保存 12 项，角色输入使用较小的记录视图；
+这里保留的是有限的问题状态，并非完整聊天原文。
+
+如果模型输出截断、JSON 格式错误或保存失败，原记录保留，聊天仍继续，响应的
+`problem_record_error` 会说明本轮记录未更新。`problem_record` 返回本轮对应记录，
+前端的“运行详情”中可直接查看。“客服建议与上次回复”保留实际回复；其中的结构化
+历史建议会在下一轮提取。
+
+查看同一用户同一会话最近 50 个问题记录：
+
+```bash
+curl 'http://localhost:8000/memory/problems?user_id=user_001&conv_id=session_001'
+```
+
+`active=true` 标识最近选中的问题，其状态可能已经解决。问题记录与历史摘要、用户
+画像不同，不会自动跨会话续接，也不会从部署前的历史聊天自动回填。
+
+运行记忆和问题处理记录检查（无需真实模型或数据库服务）：
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
 
 工作记忆压缩发生在 `memory/conversation_memory.py` 中。默认配置：
 
