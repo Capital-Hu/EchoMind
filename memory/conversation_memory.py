@@ -25,7 +25,7 @@ import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, get_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ class MemoryManager:
 
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=2048, temperature=0.0,
+                model=self._model, max_tokens=get_max_tokens(), temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
@@ -281,7 +281,7 @@ class MemoryManager:
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=768, temperature=0.0,
+                model=self._model, max_tokens=get_max_tokens(), temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
             summary = self._safe_text(extract_text_content(resp.content)).strip()
@@ -434,7 +434,7 @@ class MemoryManager:
 新增摘要:
 {new_summary}""")
         resp = await self._client.messages.create(
-            model=self._model, max_tokens=1024, temperature=0.0,
+            model=self._model, max_tokens=get_max_tokens(), temperature=0.0,
             messages=[{"role": "user", "content": prompt}],
         )
         merged = self._safe_text(extract_text_content(resp.content)).strip()

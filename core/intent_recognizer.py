@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, get_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +271,7 @@ class IntentRecognizer:
         try:
             resp = await self.client.messages.create(
                 model=self.model,
-                max_tokens=256,
+                max_tokens=get_max_tokens(),
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
             )

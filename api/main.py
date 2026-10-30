@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+from core.llm_utils import get_max_tokens
+
 load_dotenv()
 
 logging.basicConfig(
@@ -54,6 +56,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
     if not key:
         raise RuntimeError("未设置 ANTHROPIC_API_KEY")
+    get_max_tokens()  # 启动时校验，避免配置错误被后续各阶段降级掩盖。
     cfg: Dict[str, Any] = {
         "api_key":  key,
         "model":    os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip(),
@@ -81,6 +84,7 @@ async def lifespan(app: FastAPI):
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
+    logger.info(f"模型统一输出上限: {get_max_tokens()} tokens")
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
     recognizer = IntentRecognizer(

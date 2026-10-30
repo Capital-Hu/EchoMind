@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, get_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class BaseAgent:
 
         resp = await self._client.messages.create(
             model=self._model,
-            max_tokens=1024,
+            max_tokens=get_max_tokens(),
             system=self._build_system_prompt(req),
             messages=messages,
         )

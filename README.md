@@ -63,6 +63,22 @@ ANTHROPIC_MODEL=deepseek-v4-pro
 ANTHROPIC_API_KEY=your_deepseek_key
 ```
 
+所有模型调用的输出上限统一在 `.env` 配置，默认 4096，必须是正整数：
+
+```env
+CLAUDE_MAX_TOKENS=4096
+```
+
+意图识别、查询改写、检索重排、用户画像、摘要生成与合并、Agent 回复和评测均使用
+这个值。它只控制输出额度，思考模式仍沿用当前模型设置；摘要最终仍限制在 800 字内。
+
+修改 `.env` 后，本地运行需重新启动后端进程。Docker Compose 需重新创建应用容器
+以加载新环境变量，仅执行 `docker compose restart` 不会重新读取 `.env`：
+
+```bash
+docker compose up -d --no-deps --force-recreate echomind
+```
+
 Docker Compose 场景下，Redis 和 ChromaDB 的连接由 `docker-compose.yml` 覆盖为容器内地址。通常不需要手动改：
 
 ```env
