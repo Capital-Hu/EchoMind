@@ -125,9 +125,13 @@ class ProblemRecordManager:
         self._model = model
 
     async def prepare(self, user_id: str, conv_id: str, message: str,
-                      recent_messages: Optional[List[Dict[str, str]]] = None) -> RecordResult:
+                      recent_messages: Optional[List[Dict[str, str]]] = None,
+                      operation_id: Optional[str] = None) -> RecordResult:
         try:
             previous = await asyncio.to_thread(self.store.active, user_id, conv_id)
+            # 写入成功但图节点尚未保存就中断时，恢复不重复增加问题轮次。
+            if operation_id and previous.get("prepared_request_id") == operation_id:
+                return RecordResult(record=previous)
             prompt = self._prompt(previous, message, recent_messages or [])
             response = await self._client.messages.create(
                 model=self._model, max_tokens=get_max_tokens(), temperature=0.0,
@@ -147,6 +151,8 @@ class ProblemRecordManager:
             if delta["relation"] == "none":
                 return RecordResult()
             record = self._apply(previous, delta, message)
+            if operation_id:
+                record["prepared_request_id"] = operation_id
             await asyncio.to_thread(self.store.save, user_id, conv_id, record, True)
             return RecordResult(record=record)
         except Exception as ex:

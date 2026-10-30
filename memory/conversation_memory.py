@@ -173,6 +173,30 @@ class MemoryManager:
             if await self._redis.llen(key) >= self.COMPRESS_AT:
                 await self._compress_locked(user_id, conv_id)
 
+    async def save_exchange_once(self, user_id: str, conv_id: str, message: str,
+                                 reply: str, request_id: str) -> bool:
+        """一轮消息与去重标记原子写入；checkpoint 恢复时不重复追加。"""
+        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        identity = json.dumps([user_id, conv_id, request_id], ensure_ascii=True)
+        marker = "exchange_once:" + hashlib.sha256(identity.encode()).hexdigest()
+        timestamp = datetime.now().isoformat()
+        rows = [json.dumps({"role": role.value, "content": self._safe_text(content),
+                            "ts": timestamp, "metadata": {"request_id": request_id}})
+                for role, content in ((MsgRole.USER, message), (MsgRole.ASSISTANT, reply))]
+        script = """
+            if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+            redis.call('LPUSH', KEYS[1], ARGV[1], ARGV[2])
+            redis.call('EXPIRE', KEYS[1], ARGV[3])
+            redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
+            return 1
+        """
+        key = self._wm_key(user_id, conv_id)
+        async with self._lock_for(user_id, conv_id):
+            added = await self._redis.eval(script, 2, key, marker, rows[0], rows[1], 86400)
+            if await self._redis.llen(key) >= self.COMPRESS_AT:
+                await self._compress_locked(user_id, conv_id)
+        return bool(added)
+
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。

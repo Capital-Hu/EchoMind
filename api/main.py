@@ -26,6 +26,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from core.llm_utils import get_max_tokens
+from agents.chat_workflow import ChatWorkflow, WorkflowConflict, WorkflowExecutionError
 
 load_dotenv()
 
@@ -51,6 +52,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_workflow = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -69,11 +71,11 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _workflow
 
     print(BANNER, flush=True)
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request
+    from agents.agent_orchestrator import AgentOrchestrator
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
@@ -182,13 +184,18 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
-    logger.info("EchoMind 已就绪")
-    yield
-
-    await _monitor.stop()
-    if _memory is not None:
+    _workflow = ChatWorkflow(_memory, _orchestrator, _build_knowledge_context)
+    try:
+        await _workflow.start()
+        logger.info("LangGraph checkpoint: %s", _workflow.path)
+        logger.info("EchoMind 已就绪")
+        yield
+    finally:
+        await _workflow.close()
+        _workflow = None
+        await _monitor.stop()
         await _memory.close()
-    logger.info("EchoMind 已关闭")
+        logger.info("EchoMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -212,6 +219,13 @@ class ChatRequest(BaseModel):
     message:     str
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
+    client_request_id: Optional[str] = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+
+
+class WorkflowResumeRequest(BaseModel):
+    user_id: str = "anonymous"
+    conv_id: str
+    request_id: Optional[str] = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
 
 
 class ChatResponse(BaseModel):
@@ -233,6 +247,7 @@ class ChatResponse(BaseModel):
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
     problem_record: Dict[str, Any] = Field(default_factory=dict)
     problem_record_error: str = ""
+    workflow: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -264,94 +279,39 @@ async def reload_skills():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """
-    主对话接口。完整流程：
-      记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
-    """
-    if _orchestrator is None or _memory is None:
+    """LangGraph 持久化执行；用同一 client_request_id 重试可恢复或返回已完成结果。"""
+    if _workflow is None:
         raise HTTPException(503, "服务未就绪")
-
-    conv_id = req.conv_id or str(uuid.uuid4())
-    async with _memory.conversation_lock(req.user_id, conv_id):
-        return await _chat_turn(req, conv_id)
-
-
-async def _chat_turn(req: ChatRequest, conv_id: str) -> ChatResponse:
-    from agents.agent_orchestrator import Request as OrcReq
-    from memory.conversation_memory import MsgRole
-    from memory.problem_record import render_problem_record
-
-    # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
-    prepared = await _memory.problem_records.prepare(
-        req.user_id, conv_id, req.message,
-        [{"role": m.role.value, "content": m.content} for m in mem_ctx.recent_messages[-4:]],
+    conv_id = req.conv_id or (
+        str(uuid.uuid5(uuid.NAMESPACE_URL, f"echomind:{req.user_id}:{req.client_request_id}"))
+        if req.client_request_id else str(uuid.uuid4())
     )
-    mem_ctx.problem_record = prepared.record
+    return await _workflow_response(_workflow.handle_turn(
+        req.message, req.user_id, conv_id, req.client_request_id,
+    ))
 
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
-    history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
-    if prepared.record:
-        # 识别短续接消息时，也知道当前正在处理的问题；不是历史用户原话。
-        history = [{"role": "system", "content": render_problem_record(prepared.record)}] + (history or [])[-2:]
 
-    intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
-    context_parts = [mem_ctx.to_prompt_text()]
-    if knowledge_text:
-        context_parts.append(knowledge_text)
-    full_context = "\n\n".join(part for part in context_parts if part)
+async def _workflow_response(call):
+    try:
+        return ChatResponse(**await call)
+    except WorkflowConflict as ex:
+        raise HTTPException(409, str(ex)) from ex
+    except WorkflowExecutionError as ex:
+        raise HTTPException(503, str(ex)) from ex
 
-    orch_req = OrcReq(
-        message=req.message,
-        user_id=req.user_id,
-        conv_id=conv_id,
-        context=full_context,
-        history=history,
-        entities=intent_result.entities,
-        intent=intent_result.intent,
-        intent_group=intent_result.intent_group,
-        urgency=intent_result.urgency,
-        intent_confidence=intent_result.confidence,
-    )
 
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
-    recorded = await _memory.problem_records.finish(
-        req.user_id, conv_id, prepared.record, result.response, result.agent_type.value,
-        [agent.value for agent in result.agent_types],
-    )
+@app.get("/workflow/status", tags=["Workflow"])
+async def workflow_status(user_id: str, conv_id: str):
+    if _workflow is None:
+        raise HTTPException(503, "服务未就绪")
+    return await _workflow.status(user_id, conv_id)
 
-    # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-    # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
-
-    return ChatResponse(
-        conv_id=conv_id,
-        response=result.response,
-        intent=result.intent.value if result.intent else "other",
-        intent_group=intent_result.intent_group,
-        agent_type=result.agent_type.value,
-        agent_types=[agent_type.value for agent_type in result.agent_types],
-        primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
-        supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
-        routing_reason=result.routing_reason,
-        routing_confidence=result.routing_confidence,
-        escalated=result.escalated,
-        latency_ms=round(result.latency_ms, 1),
-        knowledge_used=knowledge_used,
-        entities=intent_result.entities,
-        intent_confidence=round(intent_result.confidence, 4),
-        intent_source_scores=intent_result.source_scores,
-        problem_record=recorded.record,
-        problem_record_error=prepared.error or recorded.error,
-    )
+@app.post("/workflow/resume", response_model=ChatResponse, tags=["Workflow"])
+async def workflow_resume(req: WorkflowResumeRequest):
+    if _workflow is None:
+        raise HTTPException(503, "服务未就绪")
+    return await _workflow_response(_workflow.resume(req.user_id, req.conv_id, req.request_id))
 
 
 @app.get("/memory/problems", tags=["Memory"])
@@ -619,12 +579,12 @@ async def run_eval(body: Optional[EvalRunInput] = None):
 
 
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
-async def _cli():
+async def _cli(user_id: str = "cli_user", conv_id: Optional[str] = None):
     print(BANNER)
-    print("EchoMind CLI — 输入 quit 退出\n")
+    print("EchoMind CLI — 输入 quit 退出，/resume 恢复未完成请求\n")
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request
-    from memory.conversation_memory import MemoryManager, MsgRole
+    from agents.agent_orchestrator import AgentOrchestrator
+    from memory.conversation_memory import MemoryManager
     from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
@@ -650,51 +610,40 @@ async def _cli():
         model=cfg["model"],
     )
 
-    user_id, conv_id = "cli_user", str(uuid.uuid4())
-
-    while True:
-        try:
-            msg = input("你: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见 ʕ•ᴥ•ʔ")
-            break
-        if not msg or msg.lower() in ("quit", "exit", "退出"):
-            print("再见 ʕ•ᴥ•ʔ")
-            break
-
-        ctx = await mem.get_context(user_id, conv_id, query=msg)
-        prepared = await mem.problem_records.prepare(
-            user_id, conv_id, msg,
-            [{"role": m.role.value, "content": m.content} for m in ctx.recent_messages[-4:]],
-        )
-        ctx.problem_record = prepared.record
-        history = [
-            {"role": m.role.value, "content": m.content}
-            for m in ctx.recent_messages[-5:]
-        ] if ctx.recent_messages else None
-        if prepared.record:
-            from memory.problem_record import render_problem_record
-            history = [{"role": "system", "content": render_problem_record(prepared.record)}] + (history or [])[-2:]
-        req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
-        result = await orch.run(req)
-        recorded = await mem.problem_records.finish(
-            user_id, conv_id, prepared.record, result.response, result.agent_type.value,
-            [agent.value for agent in result.agent_types],
-        )
-
-        await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
-        await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
-
-        print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
-        if prepared.error or recorded.error:
-            print(f"处理记录：{prepared.error or recorded.error}\n")
-
-    await mem.close()
+    conv_id = conv_id or str(uuid.uuid4())
+    print(f"当前会话：{conv_id}（重启时可用 --conv-id 接续）")
+    workflow = ChatWorkflow(mem, orch)
+    try:
+        await workflow.start()
+        while True:
+            try:
+                msg = (await asyncio.to_thread(input, "你: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not msg or msg.lower() in ("quit", "exit", "退出"):
+                break
+            try:
+                result = await workflow.resume(user_id, conv_id) if msg == "/resume" else await workflow.handle_turn(msg, user_id, conv_id)
+                print(f"\nEchoMind [{result['agent_type']}]: {result['response']}\n")
+                if result["problem_record_error"]:
+                    print(f"处理记录：{result['problem_record_error']}\n")
+            except (WorkflowConflict, WorkflowExecutionError) as ex:
+                print(f"处理提示：{ex}\n")
+    finally:
+        await workflow.close()
+        await mem.close()
+    print("再见 ʕ•ᴥ•ʔ")
 
 
 if __name__ == "__main__":
     if "--cli" in sys.argv:
-        asyncio.run(_cli())
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--cli", action="store_true")
+        parser.add_argument("--user-id", default="cli_user")
+        parser.add_argument("--conv-id")
+        args = parser.parse_args()
+        asyncio.run(_cli(args.user_id, args.conv_id))
     else:
         uvicorn.run(
             "api.main:app",

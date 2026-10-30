@@ -7,6 +7,7 @@ EchoMind 是一个企业级智能客服系统，核心链路为：
 ```text
 用户请求
   -> FastAPI /chat
+  -> LangGraph 工作流（每一步完成后写入 SQLite checkpoint）
   -> MemoryManager 读取 Redis 工作记忆 + ChromaDB 情景记忆 + 用户画像
   -> IntentRecognizer 识别意图
   -> AgentOrchestrator 路由到 General/Technical/Billing Agent
@@ -21,6 +22,7 @@ EchoMind/
 ├── api/main.py                    # FastAPI 入口，/chat /search /knowledge /monitor /eval
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
+├── agents/chat_workflow.py        # LangGraph 节点、持久化与中断恢复
 ├── memory/conversation_memory.py  # Redis + ChromaDB 记忆管理
 ├── memory/problem_record.py       # 按问题保存用户反馈、已尝试方法及接手 Agent
 ├── mcp/tool_manager.py            # MCP 工具调用、查询改写、重排、熔断、缓存、降级
@@ -247,6 +249,8 @@ http://localhost/docs
 |------|------|----------|------|----------|
 | `GET` | `/health` | 无 | 健康检查，返回服务状态和 Agent 统计 | 启动后确认服务可用 |
 | `POST` | `/chat` | JSON Body | 主对话接口，完成记忆读取、意图识别、Agent 路由、回复生成、记忆写入 | 业务主链路 |
+| `GET` | `/workflow/status` | Query 参数 | 查看当前请求已保存的进度与下一步 | 排查中断位置 |
+| `POST` | `/workflow/resume` | JSON Body | 从持久化进度继续最后一条未完成请求 | 重启或异常后恢复 |
 | `GET` | `/monitor` | 无 | 查看 Agent/工具统计、告警和优化建议 | 观察在线表现 |
 | `POST` | `/search` | Query 参数 | 执行知识库检索优化链路：查询改写、并行召回、合并去重、LLM 重排 | 测试 RAG 检索 |
 | `GET` | `/skills` | 无 | 查看当前加载的 Skills、匹配关键词和解析错误 | 确认动态能力是否生效 |
@@ -350,6 +354,7 @@ curl http://localhost:8000/health
 | `message` | 是 | 用户输入 |
 | `user_id` | 否 | 用户 ID，默认 `anonymous` |
 | `conv_id` | 否 | 会话 ID，不传则自动生成 |
+| `client_request_id` | 否 | 同一消息重试时沿用同一编号，恢复进度或返回原结果 |
 
 返回字段：
 
@@ -361,6 +366,66 @@ curl http://localhost:8000/health
 | `agent_type` | 实际处理请求的 Agent |
 | `escalated` | 是否触发升级 |
 | `latency_ms` | 端到端耗时 |
+| `workflow` | 请求编号、checkpoint 编号、执行路径及恢复/缓存标记 |
+
+### LangGraph 进度保存与恢复
+
+`/chat` 和 CLI 已使用真正的 LangGraph `StateGraph`，通过 `AsyncSqliteSaver` 保存状态。
+现阶段是单实例应用，使用独立 SQLite 文件，后续多实例部署再考虑 PostgreSQL。
+
+```text
+读取记忆 -> 更新问题记录 -> 识别意图 -> 检索知识
+        -> Agent 回复 -> 保存问题回复 -> 写入本轮聊天
+```
+
+每一步完成后同步保存 checkpoint，再执行下一步。保存的是这一轮的输入、已完成步骤、
+中间结果及下一步位置；它与面向客服的问题处理记录、Chroma 向量记忆用途不同。
+例如知识检索时失败，重试会从检索继续，前面的问题提取和意图识别不会再次调用模型。
+进行到一半的节点可能重新执行；当前聊天写入使用 Redis 原子去重，问题记录更新也带请求编号去重。
+
+存储位置：
+
+- 本地 `.env`：`WORKFLOW_CHECKPOINT_PATH=./data/workflow/checkpoints.sqlite3`
+- Docker：`/app/data/workflow/checkpoints.sqlite3`，挂载宿主机 `./data/workflow`
+- 重建容器保留进度；数据库文件不打包进镜像，也不提交到 Git。
+- checkpoint 会保存聊天上下文，目前没有自动清理历史版本的策略。
+
+发送消息时带上 `client_request_id`，同一条消息重试时继续使用同一编号：
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"demo","conv_id":"chat-1","client_request_id":"request-1","message":"无法登录"}'
+```
+
+成功响应新增 `workflow` 字段，包含 `request_id`、`checkpoint_id`、`node_path`、
+`resumed`（本次是否恢复）、`cached`（是否直接返回已有结果）。已成功的请求重试直接返回原结果。
+前端已经会为 Python 聊天请求发送此编号，并在请求失败后的同页重试中沿用。
+如果首条消息未带 `conv_id`，相同用户与请求编号仍会对应同一会话，以便第一次请求失败后恢复。
+
+查询保存到哪一步：
+
+```bash
+curl 'http://localhost:8000/workflow/status?user_id=demo&conv_id=chat-1'
+```
+
+中断时返回 `phase=interrupted`、`resumable=true` 和 `next`（下一步）。
+显式恢复最后一条未完成请求，也可以直接重发原消息：
+
+```bash
+curl -X POST http://localhost:8000/workflow/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"demo","conv_id":"chat-1","request_id":"request-1"}'
+```
+
+恢复由请求触发，重启后不会自动执行所有未完成任务。同一用户的同一会话串行执行，
+有未完成请求时发送另一条消息返回 HTTP 409，避免新消息覆盖进度。
+CLI 可通过 `python -m api.main --cli --conv-id chat-1` 接续会话，输入 `/resume` 恢复。
+用户画像仍在回复后后台更新，不属于这条可恢复流程。
+
+这一阶段保存现有聊天流程的进度，尚未接入真实 MCP 退款或订单写操作。
+后续接入业务工具时，仍需为每项写操作实现业务去重和结果核查；checkpoint 本身不能保证外部操作只执行一次。
+当前锁只覆盖单个应用进程，不支持多个应用实例同时处理同一会话。
 
 ### 5.5 `/search`
 

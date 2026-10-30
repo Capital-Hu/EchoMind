@@ -222,12 +222,14 @@ class ProblemRecordApiTests(ProblemRecordFixture):
         from agents.agent_orchestrator import AgentType, OrchestratorResult
         from core.intent_recognizer import IntentCategory, UrgencyLevel
         from memory.conversation_memory import MemoryContext, MemoryManager
+        from agents.chat_workflow import ChatWorkflow
 
         memory = MemoryManager.__new__(MemoryManager)
         memory._turn_locks = {}
         memory.problem_records = self.manager
         memory.get_context = AsyncMock(return_value=MemoryContext([], [], {}, ""))
         memory.add_message = AsyncMock()
+        memory.save_exchange_once = AsyncMock(return_value=True)
         memory.update_profile = AsyncMock()
         intent = SimpleNamespace(intent=IntentCategory.TECHNICAL_LOGIN, intent_group="technical",
                                  urgency=UrgencyLevel.LOW, confidence=0.9, entities={}, source_scores={})
@@ -238,10 +240,13 @@ class ProblemRecordApiTests(ProblemRecordFixture):
                 intent=IntentCategory.TECHNICAL_LOGIN,
             )),
         )
-        with patch.object(api, "_memory", memory), patch.object(api, "_orchestrator", orchestrator), \
-             patch.object(api, "_build_knowledge_context", AsyncMock(return_value=("", False))):
-            result = await api.chat(api.ChatRequest(user_id="user", conv_id="chat", message="我无法登录"))
-            viewed = await api.problem_records(user_id="user", conv_id="chat")
+        workflow = ChatWorkflow(memory, orchestrator, path=Path(self.temp.name) / "checkpoints.sqlite3")
+        try:
+            with patch.object(api, "_memory", memory), patch.object(api, "_workflow", workflow):
+                result = await api.chat(api.ChatRequest(user_id="user", conv_id="chat", message="我无法登录"))
+                viewed = await api.problem_records(user_id="user", conv_id="chat")
+        finally:
+            await workflow.close()
         self.assertIn("[问题处理记录]", orchestrator.run.call_args.args[0].context)
         history = orchestrator.recognize_intent.call_args.kwargs["history"]
         self.assertIn("登录失败", history[0]["content"])

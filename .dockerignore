@@ -18,6 +18,7 @@ logs/
 !.env.example
 
 data/chroma/
+data/workflow/
 data/**/*.sqlite3
 data/.DS_Store
 

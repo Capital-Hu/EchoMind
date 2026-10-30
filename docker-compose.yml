@@ -84,9 +84,11 @@ services:
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - ECHOMIND_SKILLS_DIR=/app/skills
+      - WORKFLOW_CHECKPOINT_PATH=/app/data/workflow/checkpoints.sqlite3
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - ./data/workflow:/app/data/workflow
       - ./skills:/app/skills
       - ./logs:/app/logs
     depends_on:
