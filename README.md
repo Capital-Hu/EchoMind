@@ -11,7 +11,7 @@ EchoMind 是一个企业级智能客服系统，核心链路为：
   -> MemoryManager 读取 Redis 工作记忆 + ChromaDB 情景记忆 + 用户画像
   -> IntentRecognizer 识别意图
   -> AgentOrchestrator 路由到 General/Technical/Billing Agent
-  -> LLM 生成回复
+  -> LLM 自行决定工具调用，接收实际结果后继续决策或生成回复
   -> 写入 Redis，并异步更新 ChromaDB 用户画像
 ```
 
@@ -23,9 +23,10 @@ EchoMind/
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
 ├── agents/chat_workflow.py        # LangGraph 节点、持久化与中断恢复
+├── agents/tool_calling.py         # 原生 tool_use / tool_result 多轮循环
 ├── memory/conversation_memory.py  # Redis + ChromaDB 记忆管理
 ├── memory/problem_record.py       # 按问题保存用户反馈、已尝试方法及接手 Agent
-├── mcp/tool_manager.py            # MCP 工具调用、查询改写、重排、熔断、缓存、降级
+├── mcp/tool_manager.py            # 进程内工具注册与执行、改写、重排、缓存、降级
 ├── mcp/knowledge_base.py          # ChromaDB RAG 知识库
 ├── monitor/performance_monitor.py # Agent/工具在线监控
 ├── evaluation/evaluator.py        # 端到端评测
@@ -367,6 +368,51 @@ curl http://localhost:8000/health
 | `escalated` | 是否触发升级 |
 | `latency_ms` | 端到端耗时 |
 | `workflow` | 请求编号、checkpoint 编号、执行路径及恢复/缓存标记 |
+| `tools_used` | 本轮实际执行过或命中缓存的工具名称 |
+| `tool_traces` | 模型调用编号、实际参数、执行结果、错误、耗时和缓存标记 |
+
+### 原生 function calling
+
+API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型通过 `tool_use`
+给出工具名和参数；后端调用已注册的真实 handler，再按相同 `tool_use_id` 回传 `tool_result`。
+模型可以根据结果继续调用工具，或直接回答。实现参考
+[Anthropic 工具定义](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)与
+[DeepSeek Anthropic 兼容协议](https://api-docs.deepseek.com/guides/anthropic_api/)。
+
+当前提供 `knowledge_search`，读取现有 ChromaDB 知识库。聊天不再按关键词提前检索：
+模型自行决定是否检索、搜索什么、取多少条，以及是否调整查询再次检索。
+`/search` 仍提供主动查询改写与重排接口。现有对话记忆、问题记录和 Skills 继续提供背景。
+
+```text
+模型收到工具定义与用户问题
+  -> 返回 tool_use（例如 knowledge_search，query="退款审核及到账时间"）
+  -> 后端校验参数并查询 ChromaDB
+  -> 回传 tool_result（真实文档或错误）
+  -> 模型继续决策，最终生成回复
+```
+
+每个 Agent 最多执行 4 轮工具响应、处理 8 个工具请求，达到上限后另做一轮仅允许回答的模型调用。
+工具未注册、未向该 Agent 开放、参数不合法或执行超时，都会返回明确错误。
+供应商返回的完整 assistant 内容（包括思考块）会带回下一轮，执行证据只记录工具信息。
+工具超时或降级内容不标为已核实知识，`knowledge_used` 根据实际成功检索结果计算。
+
+在 Swagger 的 `/chat` 中可以测试：
+
+```json
+{
+  "user_id": "function-demo",
+  "conv_id": "function-demo-chat",
+  "client_request_id": "function-demo-1",
+  "message": "平台退款申请审核和到账分别需要多久？"
+}
+```
+
+查看响应中的 `tools_used` 和 `tool_traces`。每个 trace 包含模型返回的 `tool_use_id`、
+`input` 参数、`executed`（是否进入 handler）、`success`、`result`、`error`、`latency_ms`
+与 `cached`；缓存命中会返回旧结果并标记，handler 不重复运行。
+这些证据也随 Agent 结果存入 checkpoint，成功请求重试时直接返回原证据。
+
+本阶段工具通过现有进程内注册表执行；独立 MCP Client/Server、订单退款业务库与前端证据面板待后续接入。
 
 ### LangGraph 进度保存与恢复
 
@@ -374,13 +420,15 @@ curl http://localhost:8000/health
 现阶段是单实例应用，使用独立 SQLite 文件，后续多实例部署再考虑 PostgreSQL。
 
 ```text
-读取记忆 -> 更新问题记录 -> 识别意图 -> 检索知识
-        -> Agent 回复 -> 保存问题回复 -> 写入本轮聊天
+读取记忆 -> 更新问题记录 -> 识别意图
+        -> Agent（原生工具循环与回复） -> 保存问题回复 -> 写入本轮聊天
 ```
 
 每一步完成后同步保存 checkpoint，再执行下一步。保存的是这一轮的输入、已完成步骤、
 中间结果及下一步位置；它与面向客服的问题处理记录、Chroma 向量记忆用途不同。
-例如知识检索时失败，重试会从检索继续，前面的问题提取和意图识别不会再次调用模型。
+例如 Agent 节点抛出异常，恢复会从 Agent 继续，前面的问题提取和意图识别不会再次调用模型。
+知识检索统一在 Agent 工具循环中执行，由模型决定是否调用。
+当前循环整体属于 `run_agent` 节点，尚未逐次工具调用保存 checkpoint。
 进行到一半的节点可能重新执行；当前聊天写入使用 Redis 原子去重，问题记录更新也带请求编号去重。
 
 存储位置：
@@ -429,7 +477,7 @@ CLI 可通过 `python -m api.main --cli --conv-id chat-1` 接续会话，输入 
 
 ### 5.5 `/search`
 
-用途：测试 MCP 工具调用和 RAG 检索优化。
+用途：主动运行知识检索和 RAG 检索优化。
 
 Query 参数：
 

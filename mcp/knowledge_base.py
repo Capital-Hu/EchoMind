@@ -153,7 +153,7 @@ class KnowledgeBase:
         ))
         """
         query = params.get("query", "")
-        top_k = params.get("top_k", 5)
+        top_k = params.get("top_k", 3)
         return await self.search_async(query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────

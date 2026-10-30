@@ -36,12 +36,11 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 intent=IntentCategory.TECHNICAL_LOGIN, agent_types=[AgentType.TECHNICAL],
             )),
         )
-        self.knowledge = AsyncMock(return_value=("知识", True))
         self.instances = []
         self.workflow = self.new_workflow()
 
     def new_workflow(self):
-        workflow = ChatWorkflow(self.memory, self.orchestrator, self.knowledge, path=self.path)
+        workflow = ChatWorkflow(self.memory, self.orchestrator, path=self.path)
         self.instances.append(workflow)
         return workflow
 
@@ -63,7 +62,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_state_survives_new_instance_and_cached_retry(self):
         result = await self.turn()
         self.assertEqual(result["workflow"]["node_path"], list(ChatWorkflow.NODES))
-        self.assertTrue(result["knowledge_used"])
+        self.assertFalse(result["knowledge_used"])
         self.assertEqual(result["problem_record"]["last_reply"], result["response"])
         await self.workflow.close()
         self.workflow = self.new_workflow()
@@ -78,21 +77,21 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("私有上下文", str(status))
 
     async def test_resume_after_restart_skips_completed_model_calls(self):
-        self.knowledge.side_effect = RuntimeError("检索中断")
+        self.orchestrator.run.side_effect = RuntimeError("Agent 中断")
         with self.assertRaises(WorkflowExecutionError):
             await self.turn()
         status = await self.workflow.status("user", "chat")
-        self.assertEqual(status["next"], ["retrieve_knowledge"])
+        self.assertEqual(status["next"], ["run_agent"])
         self.assertTrue(status["resumable"])
         await self.workflow.close()
         self.workflow = self.new_workflow()
-        self.knowledge.side_effect = None
+        self.orchestrator.run.side_effect = None
         result = await self.workflow.resume("user", "chat", "r1")
         self.assertTrue(result["workflow"]["resumed"])
         self.memory.get_context.assert_awaited_once()
         self.client.messages.create.assert_awaited_once()
         self.orchestrator.recognize_intent.assert_awaited_once()
-        self.orchestrator.run.assert_awaited_once()
+        self.assertEqual(self.orchestrator.run.await_count, 2)
         self.assertEqual(result["workflow"]["node_path"], list(ChatWorkflow.NODES))
 
     async def test_write_succeeded_before_node_failed_does_not_duplicate_messages(self):
@@ -206,7 +205,6 @@ asyncio.run(main())
         self.memory.get_context.assert_not_awaited()
         self.client.messages.create.assert_not_awaited()
         self.orchestrator.recognize_intent.assert_not_awaited()
-        self.knowledge.assert_not_awaited()
         self.orchestrator.run.assert_awaited_once()
 
     async def test_same_conversation_is_serial_and_other_conversation_can_run(self):
@@ -234,10 +232,10 @@ asyncio.run(main())
         payload = {"user_id": "user", "message": "我无法登录", "client_request_id": "r1"}
         with patch.object(api, "_workflow", self.workflow):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
-                self.knowledge.side_effect = RuntimeError("中断")
+                self.orchestrator.run.side_effect = RuntimeError("中断")
                 failed = await client.post("/chat", json=payload)
                 self.assertEqual(failed.status_code, 503)
-                self.knowledge.side_effect = None
+                self.orchestrator.run.side_effect = None
                 recovered = await client.post("/chat", json=payload)
                 self.assertEqual(recovered.status_code, 200, recovered.text)
                 data = recovered.json()

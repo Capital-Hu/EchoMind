@@ -69,6 +69,56 @@ def _anthropic_cfg() -> Dict[str, Any]:
     return cfg
 
 
+async def _create_tool_manager(cfg):
+    from mcp.knowledge_base import KnowledgeBase
+    from mcp.tool_manager import MCPToolManager, Tool
+
+    manager = MCPToolManager(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+    )
+    kb = KnowledgeBase(
+        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
+        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
+        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+    )
+    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+
+    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
+        query = params.get("query", "")
+        return [{
+            "title": "知识库降级结果",
+            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
+            "score": 0.0,
+            "fallback": True,
+            "error": error,
+        }]
+
+    manager.register(Tool(
+        name="knowledge_search",
+        description=("搜索平台知识库，核实退款、发票、物流、账户及技术问题的政策和办理要求。"
+                     "返回文档标题、正文和相关度；这是文档检索，不能查询用户订单或执行退款。"
+                     "query 填搜索主题，top_k 可选，范围 1 到 8。"),
+        handler=kb.search_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 8},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        agent_types=("general", "technical", "billing"),
+        cache_ttl=300.0,
+        supports_rerank=True,
+        fallback=knowledge_fallback,
+    ))
+
+    return manager
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _workflow
@@ -78,8 +128,6 @@ async def lifespan(app: FastAPI):
     from agents.agent_orchestrator import AgentOrchestrator
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -123,45 +171,8 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
-    _tool_manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-    kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-    )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
-
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
-
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
+    _tool_manager = await _create_tool_manager(cfg)
+    _orchestrator.set_tool_manager(_tool_manager)
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -184,7 +195,7 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
-    _workflow = ChatWorkflow(_memory, _orchestrator, _build_knowledge_context)
+    _workflow = ChatWorkflow(_memory, _orchestrator)
     try:
         await _workflow.start()
         logger.info("LangGraph checkpoint: %s", _workflow.path)
@@ -248,6 +259,8 @@ class ChatResponse(BaseModel):
     problem_record: Dict[str, Any] = Field(default_factory=dict)
     problem_record_error: str = ""
     workflow: Dict[str, Any] = Field(default_factory=dict)
+    tools_used: List[str] = Field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -326,68 +339,6 @@ async def problem_records(user_id: str, conv_id: str):
     return {"records": records}
 
 
-async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
-    """
-    为 /chat 主链路构建 RAG 知识上下文。
-
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
-    """
-    if _tool_manager is None:
-        return "", False
-    if not _should_use_knowledge(message, intent=intent):
-        return "", False
-    try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
-        if not result.success or not isinstance(result.data, list) or not result.data:
-            return "", False
-
-        parts = ["[知识库检索结果]"]
-        used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title", "未命名文档"))
-            content = str(item.get("content", "")).strip()
-            score = item.get("score", "")
-            if not content:
-                continue
-            used = True
-            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:600]}")
-
-        if not used:
-            return "", False
-        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。")
-        return "\n".join(parts), True
-    except Exception as ex:
-        logger.warning(f"构建知识库上下文失败: {ex}")
-        return "", False
-
-
-def _should_use_knowledge(message: str, intent=None) -> bool:
-    """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    intent_value = getattr(intent, "value", intent)
-    if intent_value in {"greeting", "feedback", "escalation", "human_handoff", "other"}:
-        return False
-    if intent_value in {
-        "query", "request", "technical", "billing", "account", "complaint",
-        "order_status", "logistics", "refund", "invoice", "payment_issue",
-        "account_security", "technical_login", "technical_crash",
-    }:
-        return True
-    greetings = {"你好", "您好", "嗨", "hi", "hello", "hey", "早上好", "晚上好"}
-    if msg in greetings:
-        return False
-    business_keywords = [
-        "退款", "订单", "物流", "配送", "发票", "扣款", "支付", "账单", "订阅",
-        "登录", "报错", "错误", "崩溃", "会员", "积分", "账户", "密码", "地址",
-        "refund", "order", "invoice", "payment", "error", "login",
-    ]
-    return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
-
-
 @app.get("/monitor")
 async def monitor_summary():
     """实时监控摘要：Agent 成功率、工具统计、告警、优化建议。"""
@@ -406,7 +357,7 @@ async def prometheus_metrics():
 async def search(query: str, top_k: int = 5):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    此接口主动运行检索优化；聊天里的检索由模型选择工具。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
@@ -610,6 +561,7 @@ async def _cli(user_id: str = "cli_user", conv_id: Optional[str] = None):
         model=cfg["model"],
     )
 
+    orch.set_tool_manager(await _create_tool_manager(cfg))
     conv_id = conv_id or str(uuid.uuid4())
     print(f"当前会话：{conv_id}（重启时可用 --conv-id 接续）")
     workflow = ChatWorkflow(mem, orch)

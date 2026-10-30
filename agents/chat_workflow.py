@@ -52,8 +52,6 @@ class ChatState(TypedDict):
     problem_record: Dict[str, Any]
     problem_record_error: str
     intent: Dict[str, Any]
-    knowledge_text: str
-    knowledge_used: bool
     agent_result: Dict[str, Any]
     response: Dict[str, Any]
 
@@ -68,14 +66,13 @@ class WorkflowExecutionError(RuntimeError):
 
 class ChatWorkflow:
     NODES = (
-        "load_context", "prepare_problem", "recognize_intent", "retrieve_knowledge",
+        "load_context", "prepare_problem", "recognize_intent",
         "run_agent", "save_problem_reply", "save_exchange",
     )
 
-    def __init__(self, memory, orchestrator, knowledge_builder=None, path=None):
+    def __init__(self, memory, orchestrator, path=None):
         self.memory = memory
         self.orchestrator = orchestrator
-        self.knowledge_builder = knowledge_builder
         self.path = Path(path).resolve() if path is not None else checkpoint_path()
         if self.path == Path(memory.problem_records.store.path).resolve():
             raise ValueError("checkpoint 必须与问题处理记录使用不同数据库文件")
@@ -149,8 +146,8 @@ class ChatWorkflow:
                     "user_id": user_id, "conv_id": conv_id, "request_id": request_id,
                     "message": message, "phase": "started", "node_path": [],
                     "context": "", "recent": [], "history": [], "problem_record": {},
-                    "problem_record_error": "", "intent": {}, "knowledge_text": "",
-                    "knowledge_used": False, "agent_result": {}, "response": {},
+                    "problem_record_error": "", "intent": {},
+                    "agent_result": {}, "response": {},
                 }
                 return await self._invoke(state, state, resumed=False)
 
@@ -253,21 +250,12 @@ class ChatWorkflow:
             "entities": result.entities, "source_scores": result.source_scores,
         })
 
-    async def _retrieve_knowledge(self, state):
-        text, used = "", False
-        if self.knowledge_builder is not None:
-            text, used = await self.knowledge_builder(
-                state["message"], intent=IntentCategory(state["intent"]["intent"]),
-            )
-        return self._step(state, "retrieve_knowledge", "knowledge_ready", knowledge_text=text, knowledge_used=used)
-
     async def _run_agent(self, state):
         intent = state["intent"]
         request = Request(
             message=state["message"], user_id=state["user_id"], conv_id=state["conv_id"],
-            request_id=state["request_id"], context="\n\n".join(
-                part for part in (state["context"], state["knowledge_text"]) if part
-            ), history=state["history"] or None, entities=intent["entities"],
+            request_id=state["request_id"], context=state["context"],
+            history=state["history"] or None, entities=intent["entities"],
             intent=IntentCategory(intent["intent"]), intent_group=intent["intent_group"],
             urgency=UrgencyLevel(intent["urgency"]), intent_confidence=intent["confidence"],
         )
@@ -295,7 +283,9 @@ class ChatWorkflow:
             "primary_agent": result["primary_agent"] or result["agent_type"],
             "supporting_agents": result["supporting_agents"], "routing_reason": result["routing_reason"],
             "routing_confidence": result["routing_confidence"], "escalated": result["escalated"],
-            "latency_ms": round(result["latency_ms"], 1), "knowledge_used": state["knowledge_used"],
+            "latency_ms": round(result["latency_ms"], 1),
+            "knowledge_used": result["knowledge_used"],
+            "tools_used": result["tools_used"], "tool_traces": result["tool_traces"],
             "entities": intent["entities"], "intent_confidence": round(intent["confidence"], 4),
             "intent_source_scores": intent["source_scores"], "problem_record": state["problem_record"],
             "problem_record_error": state["problem_record_error"],

@@ -1,5 +1,5 @@
 """
-亮点：MCP 工具调用框架
+进程内工具注册与执行（MCP 协议传输将在下一阶段接入）
 
 核心问题：工具调用出错（检索不全、召回不好）怎么优化？
 
@@ -13,6 +13,7 @@
   5. 降级策略（Fallback）—— 工具不可用时返回有意义的降级结果。
 """
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -46,6 +47,7 @@ class ToolResult:
     cached:         bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
+    executed:       bool = False   # 是否实际进入 handler（缓存命中不会再次执行）
 
 
 @dataclass
@@ -118,6 +120,7 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    agent_types: tuple[str, ...] = ()        # 显式声明哪些 Agent 可从模型调用；默认不暴露
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -128,7 +131,7 @@ class Tool:
 
 class MCPToolManager:
     """
-    MCP 工具调用框架。
+    工具注册、原生 function calling 定义和进程内执行。
 
     核心优化链路（针对检索类工具）：
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
@@ -152,6 +155,12 @@ class MCPToolManager:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def definitions(self, agent_type: str) -> List[Dict[str, Any]]:
+        """转换为 Anthropic 原生工具定义；本阶段通过进程内 handler 执行。"""
+        return [{"name": tool.name, "description": tool.description,
+                 "input_schema": copy.deepcopy(tool.schema)}
+                for tool in self._tools.values() if agent_type in tool.agent_types]
+
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
     async def call(
@@ -171,11 +180,19 @@ class MCPToolManager:
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
 
+        # 模型参数不可信：先校验，再查缓存；参数错误不触发降级或熔断。
+        try:
+            self._validate_params(tool, params)
+        except ValueError as ex:
+            tool.stats.total += 1
+            tool.stats.failed += 1
+            return ToolResult(success=False, data=None, tool_name=name, error=str(ex))
+
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
 
         # 缓存命中
         if use_cache and tool.cache_ttl > 0:
-            cached = self._get_cache(name, params, cache_rerank_top_k)
+            cached = self._get_cache(name, params, cache_rerank_top_k, context)
             if cached is not None:
                 cached_data, cached_reranked = cached
                 tool.stats.total += 1
@@ -196,9 +213,6 @@ class MCPToolManager:
         t0 = time.monotonic()
         tool.stats.total += 1
         try:
-            # 参数校验（根据 JSON Schema 的 required 和 properties.type）
-            self._validate_params(tool, params)
-
             data = await asyncio.wait_for(self._run_handler(tool, params, context), timeout=tool.timeout_s)
             latency = (time.monotonic() - t0) * 1000
 
@@ -215,24 +229,24 @@ class MCPToolManager:
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
-                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked)
+                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked, context)
 
             return ToolResult(success=True, data=data, tool_name=name,
-                              latency_ms=latency, reranked=reranked)
+                              latency_ms=latency, reranked=reranked, executed=True)
 
         except asyncio.TimeoutError:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
             logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
-            return await self._fallback_result(tool, params, context, "执行超时")
+            return await self._fallback_result(tool, params, context, "执行超时", executed=True)
 
         except Exception as ex:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
             logger.error(f"工具异常: {name} — {ex}")
-            return await self._fallback_result(tool, params, context, str(ex))
+            return await self._fallback_result(tool, params, context, str(ex), executed=True)
 
     async def _fallback_result(
         self,
@@ -240,10 +254,11 @@ class MCPToolManager:
         params: Dict[str, Any],
         context: Optional[Dict[str, Any]],
         error: str,
+        executed: bool = False,
     ) -> ToolResult:
         """工具不可用时返回降级结果，而不是把空错误直接暴露给调用方。"""
         if tool.fallback is None:
-            return ToolResult(success=False, data=None, tool_name=tool.name, error=error)
+            return ToolResult(success=False, data=None, tool_name=tool.name, error=error, executed=executed)
         try:
             data = tool.fallback(params, context, error)
             if asyncio.iscoroutine(data):
@@ -253,10 +268,11 @@ class MCPToolManager:
                 data=data,
                 tool_name=tool.name,
                 error=error,
+                executed=executed,
             )
         except Exception as ex:
             logger.error(f"工具降级失败: {tool.name} — {ex}")
-            return ToolResult(success=False, data=None, tool_name=tool.name, error=f"{error}; fallback失败: {ex}")
+            return ToolResult(success=False, data=None, tool_name=tool.name, error=f"{error}; fallback失败: {ex}", executed=executed)
 
     async def _run_handler(
         self,
@@ -390,12 +406,12 @@ class MCPToolManager:
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0) -> str:
-        payload = {"params": params, "rerank_top_k": rerank_top_k}
+    def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0, context=None) -> str:
+        payload = {"params": params, "rerank_top_k": rerank_top_k, "context": context}
         return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
 
-    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0) -> Optional[Tuple[Any, bool]]:
-        key = self._cache_key(name, params, rerank_top_k)
+    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0, context=None) -> Optional[Tuple[Any, bool]]:
+        key = self._cache_key(name, params, rerank_top_k, context)
         if key in self._cache:
             data, expire_at, reranked = self._cache[key]
             if time.monotonic() < expire_at:
@@ -411,35 +427,50 @@ class MCPToolManager:
         ttl: float,
         rerank_top_k: int = 0,
         reranked: bool = False,
+        context=None,
     ) -> None:
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
                 del self._cache[k]
-        self._cache[self._cache_key(name, params, rerank_top_k)] = (data, time.monotonic() + ttl, reranked)
+        self._cache[self._cache_key(name, params, rerank_top_k, context)] = (data, time.monotonic() + ttl, reranked)
 
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 
     _TYPE_MAP = {"string": str, "number": (int, float), "integer": int, "boolean": bool, "array": list, "object": dict}
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
-        """根据工具的 JSON Schema 校验参数，不合法时抛出 ValueError。"""
-        schema = tool.schema
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-
-        for field in required:
-            if field not in params:
-                raise ValueError(f"工具 {tool.name} 缺少必需参数: {field}")
-
-        for key, value in params.items():
-            if key in properties:
-                expected_type = properties[key].get("type")
-                if expected_type and expected_type in self._TYPE_MAP:
-                    if not isinstance(value, self._TYPE_MAP[expected_type]):
-                        raise ValueError(
-                            f"工具 {tool.name} 参数 {key} 类型错误: 期望 {expected_type}，实际 {type(value).__name__}"
-                        )
+        """校验当前工具使用的 Schema 子集：对象、类型、范围、长度和枚举。"""
+        def validate(value, schema, path):
+            expected = schema.get("type")
+            kind = self._TYPE_MAP.get(expected)
+            if kind and (not isinstance(value, kind) or
+                         (expected in ("integer", "number") and isinstance(value, bool))):
+                raise ValueError(f"{path} 类型错误: 期望 {expected}")
+            if "enum" in schema and value not in schema["enum"]:
+                raise ValueError(f"{path} 不在允许的枚举值中")
+            if isinstance(value, dict):
+                for name in schema.get("required", []):
+                    if name not in value:
+                        raise ValueError(f"{path} 缺少必需参数: {name}")
+                properties = schema.get("properties", {})
+                if schema.get("additionalProperties") is False and set(value) - set(properties):
+                    raise ValueError(f"{path} 含未定义参数: {', '.join(sorted(set(value) - set(properties)))}")
+                for name, item in value.items():
+                    if name in properties:
+                        validate(item, properties[name], f"{path}.{name}")
+            if isinstance(value, str):
+                if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
+                    raise ValueError(f"{path} 长度超出允许范围")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if value < schema.get("minimum", -float("inf")) or value > schema.get("maximum", float("inf")):
+                    raise ValueError(f"{path} 超出允许的数值范围")
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    validate(item, schema.get("items", {}), f"{path}[{index}]")
+        if not isinstance(params, dict):
+            raise ValueError("工具参数必须是 JSON 对象")
+        validate(params, tool.schema, tool.name)
 
     @staticmethod
     def _clean_text(value: Any) -> str:
