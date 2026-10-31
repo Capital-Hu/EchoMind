@@ -24,6 +24,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
+# 模型资源独立成阶段，测试依赖镜像无需重新下载模型。
+FROM dependencies AS model-assets
 # 预下载 ChromaDB 内置的 ONNX embedding 模型（~79MB），避免运行时下载超时
 RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
     curl -L --retry 3 --retry-delay 5 -o /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx.tar.gz \
@@ -42,7 +44,7 @@ RUN useradd -m -u 1000 echomind
 COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 # 复制预下载的 ONNX 模型缓存
-COPY --from=dependencies --chown=echomind:echomind /root/.cache/chroma /home/echomind/.cache/chroma
+COPY --from=model-assets --chown=echomind:echomind /root/.cache/chroma /home/echomind/.cache/chroma
 
 # 复制应用代码
 COPY --chown=echomind:echomind . .
@@ -61,6 +63,8 @@ CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "
 
 # ── 阶段 4：开发镜像 ──────────────────────────────────────────────────────────
 FROM dependencies AS development
+
+COPY --from=model-assets /root/.cache/chroma /root/.cache/chroma
 
 COPY . .
 

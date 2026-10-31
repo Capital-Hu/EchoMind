@@ -6,7 +6,7 @@ anthropic==0.40.0          # LLM 调用；意图 Embedding 分支支持远端客
 # ── Web 框架 ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-pydantic==2.10.3
+pydantic==2.12.5
 python-multipart==0.0.12    # FastAPI 文件上传支持
 
 # ── 数据存储 ──────────────────────────────────────────────────────────────────
@@ -24,3 +24,9 @@ httpx==0.28.1              # monitor/performance_monitor.py webhook 告警
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
+
+# 官方 MCP SDK 与工具 Schema 校验
+mcp==1.26.0
+jsonschema==4.26.0
+sse-starlette==2.1.3
+pydantic-settings==2.12.0

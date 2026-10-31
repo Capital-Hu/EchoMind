@@ -16,7 +16,7 @@ from agents.agent_orchestrator import AgentOrchestrator, AgentType, GeneralAgent
 from agents.chat_workflow import ChatWorkflow
 from agents.tool_calling import NativeToolLoop, ToolCallingError
 from core.intent_recognizer import IntentCategory, UrgencyLevel
-from mcp.tool_manager import MCPToolManager, Tool
+from tooling.tool_manager import MCPToolManager, Tool
 from memory.conversation_memory import MemoryContext
 from memory.problem_record import ProblemRecordManager
 from test_problem_record import delta, response as problem_response
@@ -78,7 +78,7 @@ class NativeToolTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_loop()
         self.assertEqual(self.handler.await_count, 2)
         self.assertEqual(self.handler.call_args_list[1].args[0]["query"], "退款到账时间")
-        self.assertEqual(self.handler.call_args_list[0].args[1], CONTEXT)
+        self.assertEqual(self.handler.call_args_list[0].args[1], {**CONTEXT, "tool_use_id": "t1"})
         second = self.create.call_args_list[1].kwargs["messages"]
         self.assertEqual(second[-2]["content"], [thinking, tool_call()])
         self.assertEqual(second[-1]["role"], "user")

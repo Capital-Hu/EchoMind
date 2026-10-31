@@ -97,6 +97,7 @@ class NativeToolLoop:
                     name, params = call.get("name"), call.get("input")
                     started = time.monotonic()
                     executed = False
+                    transport, execution_status, receipt, retrievals = "none", "rejected", {}, []
                     if count >= self.MAX_TOOL_CALLS:
                         result = {"success": False, "data": None, "error": "工具调用数量达到上限，本次未执行"}
                     elif not isinstance(name, str) or name not in allowed:
@@ -105,11 +106,14 @@ class NativeToolLoop:
                         result = {"success": False, "data": None, "error": "工具参数必须是 JSON 对象"}
                     else:
                         try:
-                            output = await self.tool_manager.call(name, params, context=dict(context))
+                            output = await self.tool_manager.call(name, params, context={**context, "tool_use_id": call["id"]})
                             executed = output.executed
+                            transport, execution_status, receipt = output.transport, output.execution_status, output.receipt
+                            retrievals = output.retrievals
                             result = {
                                 "success": bool(output.success and not output.error), "data": output.data,
                                 "error": output.error or "", "cached": output.cached, "reranked": output.reranked,
+                                "execution_status": output.execution_status,
                             }
                         except Exception:
                             logger.exception("工具执行异常 request_id=%s tool=%s", context["request_id"], name)
@@ -126,6 +130,8 @@ class NativeToolLoop:
                         "input": copy.deepcopy(params), "executed": executed, "success": result["success"],
                         "result": copy.deepcopy(result), "error": result.get("error", ""),
                         "cached": result.get("cached", False),
+                        "transport": transport, "execution_status": execution_status, "receipt": receipt,
+                        "retrievals": retrievals,
                         "latency_ms": round((time.monotonic() - started) * 1000, 1),
                     }
                     traces.append(trace)

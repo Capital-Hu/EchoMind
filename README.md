@@ -26,8 +26,12 @@ EchoMind/
 ├── agents/tool_calling.py         # 原生 tool_use / tool_result 多轮循环
 ├── memory/conversation_memory.py  # Redis + ChromaDB 记忆管理
 ├── memory/problem_record.py       # 按问题保存用户反馈、已尝试方法及接手 Agent
-├── mcp/tool_manager.py            # 进程内工具注册与执行、改写、重排、缓存、降级
-├── mcp/knowledge_base.py          # ChromaDB RAG 知识库
+├── tooling/tool_manager.py        # MCP 工具注册、范围检查、缓存与请求转发
+├── tooling/knowledge_service.py   # MCP Server 调用的知识库业务实现与完整增强检索
+├── tooling/mcp_client.py          # 官方 SDK 的 stdio 客户端与子进程生命周期
+├── tooling/mcp_server.py          # 独立 MCP 工具进程
+├── tooling/mcp_protocol.py        # 工具 Schema、调用范围与上下文合同
+├── tooling/knowledge_base.py      # ChromaDB RAG 知识库
 ├── monitor/performance_monitor.py # Agent/工具在线监控
 ├── evaluation/evaluator.py        # 端到端评测
 ├── data/demo_docs/                # 演示知识库文档
@@ -381,12 +385,15 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 
 当前提供 `knowledge_search`，读取现有 ChromaDB 知识库。聊天不再按关键词提前检索：
 模型自行决定是否检索、搜索什么、取多少条，以及是否调整查询再次检索。
-`/search` 仍提供主动查询改写与重排接口。现有对话记忆、问题记录和 Skills 继续提供背景。
+前端演示 `/search` 和模型的 `knowledge_search` 都把完整请求交给同一个 MCP Server，
+由工具子进程内唯一的 `KnowledgeService` 实例完成改写、召回、去重与重排，再一次性返回结果。
+主程序只转发调用，不创建检索实例。现有对话记忆、问题记录和 Skills 继续提供背景。
 
 ```text
 模型收到工具定义与用户问题
   -> 返回 tool_use（例如 knowledge_search，query="退款审核及到账时间"）
-  -> 后端校验参数并查询 ChromaDB
+  -> 后端校验参数，把完整搜索请求交给 MCP Server
+  -> Server 内调用 search_with_rewrite：改写、多路查库、合并去重与重排
   -> 回传 tool_result（真实文档或错误）
   -> 模型继续决策，最终生成回复
 ```
@@ -409,10 +416,68 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 
 查看响应中的 `tools_used` 和 `tool_traces`。每个 trace 包含模型返回的 `tool_use_id`、
 `input` 参数、`executed`（是否进入 handler）、`success`、`result`、`error`、`latency_ms`
-与 `cached`；缓存命中会返回旧结果并标记，handler 不重复运行。
+与 `cached`；`retrievals` 列出工具进程内的各个子查询、结果数量和执行 PID，顶层 `receipt` 对应整次 MCP 工具调用。
+重排未执行或失败时 `reranked=false`；同一文档在不同查询下的 score 差异不会导致重复文档。
+缓存保存 Server 返回的最终增强检索结果与完整调用回执，命中时不重复发起 MCP 调用。
 这些证据也随 Agent 结果存入 checkpoint，成功请求重试时直接返回原证据。
 
-本阶段工具通过现有进程内注册表执行；独立 MCP Client/Server、订单退款业务库与前端证据面板待后续接入。
+工具通过真正的 MCP stdio Client/Server 执行。订单退款业务库与前端证据面板待后续接入。
+
+### MCP stdio 工具服务
+
+后端启动时使用官方 `mcp==1.26.0` SDK 启动 `python -m tooling.mcp_server` 子进程，
+完成 `initialize` 与 `tools/list`，核对工具集合及 Schema，再把已发现的工具提供给 Agent。
+本地模块统一使用 `tooling` 名称，官方 SDK 使用 `mcp`，不保留旧导入路径。
+
+```text
+模型 tool_use
+  -> 后端检查 Agent 可用范围与参数
+  -> MCP Client 发送一次完整的 tools/call（stdin/stdout JSON-RPC）
+  -> 独立 MCP Server 再检查会话凭据、调用范围和 JSON Schema
+  -> Server 完成改写、查询 ChromaDB、合并去重和重排
+  -> 完整增强检索结果及服务端回执
+  -> 模型 tool_result，继续决策
+```
+
+| MCP 工具 | 允许的调用范围 | 用途 |
+|---|---|---|
+| `knowledge_search` | general / technical / billing | 聊天工具，Server 完整执行增强检索 |
+| `knowledge_add` | admin | 现有知识导入、文件上传接口 |
+| `knowledge_stats` | admin | 启动检查、现有知识统计接口 |
+
+聊天模型只看到检索工具。调用范围、用户编号、会话编号、请求编号和模型工具调用编号，
+由后端通过 MCP `_meta` 传递，模型参数不能覆盖。子进程会验证每次启动生成的私有会话凭据；
+Server 通过显式白名单接收现有模型配置（API Key、模型名、Base URL、CLAUDE_MAX_TOKENS），
+用于自己发起改写和重排的模型请求；不继承 Redis 配置。这是后端与工具进程的范围检查，现有 HTTP 接口尚未提供账户登录鉴权。
+
+三个 MCP 知识工具由子进程执行，`/knowledge/add`、`/knowledge/upload`、`/knowledge/stats` 也通过 MCP。
+前端演示 `/search` 同样调用 MCP 的 `knowledge_search`，使用与聊天工具相同的服务实例和知识库连接。
+主进程的工具管理器只负责定义、范围检查、缓存和转发，不代 Server 做改写或重排。
+`mcp_server.py` 负责 MCP 协议、权限检查、超时和调用日志；`knowledge_service.py` 负责具体的知识库业务流程，
+由 Server 调用，不是另一个独立服务。演示每次都执行真实 MCP 调用，聊天工具仍可复用缓存结果。
+导入每次最多 100 篇，每篇正文最多 50000 字；上传文件仍先检查 10MB 大小限制。
+
+执行证据新增 `transport=stdio`、`execution_status` 和 `receipt`。
+回执包含 `server_pid`、`call_id`、`request_id`、`tool_use_id`，可与服务端日志相互核对。
+缓存命中时不会再次发起 MCP 调用，`cached=true`、`executed=false`，保留原调用回执。
+成功请求的工具证据仍随 checkpoint 保存。
+
+可以在 Swagger 或以下接口查看实时连接状态：
+
+```bash
+curl http://localhost:8000/mcp/status
+```
+
+`/health` 也会检测 MCP 连通性。子进程与后端在同一个容器里，关闭后端会回收子进程。
+启动/握手默认超时 30 秒，Server 内整次增强检索与主进程演示均限时 90 秒，导入执行超时 60 秒。
+断链、传输超时或结果合同错误会报告未确认/不可用，不自动重试，不改走本地直调；重启后端可建立新连接。
+
+日志保存到已有 Docker 日志挂载目录：
+
+- `logs/mcp-server.log`：进程启动、诊断及工具执行日志；协议独占 stdout，日志写 stderr。
+- `logs/mcp-tools.jsonl`：服务端收到/拒绝/完成调用的记录，含原始参数、调用上下文、内部子查询、重排标记、结果数量、错误及耗时；不记录会话凭据。
+
+MCP stdio 的运行方式参考 [官方 Python SDK](https://github.com/modelcontextprotocol/python-sdk/tree/v1.26.0)。
 
 ### LangGraph 进度保存与恢复
 
@@ -477,7 +542,7 @@ CLI 可通过 `python -m api.main --cli --conv-id chat-1` 接续会话，输入 
 
 ### 5.5 `/search`
 
-用途：主动运行知识检索和 RAG 检索优化。
+用途：主动调用 MCP `knowledge_search`，运行知识检索和 RAG 检索优化。
 
 Query 参数：
 
@@ -674,7 +739,7 @@ curl -X POST http://localhost:8000/chat \
 
 ## 7. 知识库使用
 
-EchoMind 的知识库由 `mcp/knowledge_base.py` 管理，底层使用 ChromaDB collection：
+EchoMind 的知识库由 `tooling/knowledge_base.py` 管理，底层使用 ChromaDB collection：
 
 ```text
 knowledge_base
@@ -767,7 +832,7 @@ curl -X POST "http://localhost:8000/search?query=退款需要多久到账&top_k=
 }
 ```
 
-`/search` 使用的是完整检索优化链路：
+前端演示 `/search` 和聊天模型的 `knowledge_search` 统一交给 MCP Server，在其中执行完整检索流程：
 
 ```text
 原始查询
@@ -784,7 +849,7 @@ EchoMind 使用了三个 ChromaDB collection：
 
 | Collection | 模块 | 作用 |
 |------------|------|------|
-| `knowledge_base` | `mcp/knowledge_base.py` | RAG 知识库文档片段 |
+| `knowledge_base` | `tooling/knowledge_base.py` | RAG 知识库文档片段 |
 | `episodic` | `memory/conversation_memory.py` | 压缩后的历史对话摘要 |
 | `user_profile` | `memory/conversation_memory.py` | 用户画像，包含偏好和关键实体 |
 

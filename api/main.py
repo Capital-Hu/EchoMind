@@ -10,7 +10,7 @@ import os
 import pathlib
 import sys
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 
@@ -22,11 +22,13 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from jsonschema import ValidationError
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from core.llm_utils import get_max_tokens
 from agents.chat_workflow import ChatWorkflow, WorkflowConflict, WorkflowExecutionError
+from tooling.mcp_protocol import CATALOG, validate_arguments
 
 load_dotenv()
 
@@ -69,54 +71,36 @@ def _anthropic_cfg() -> Dict[str, Any]:
     return cfg
 
 
+def _tool_context(scope, source):
+    return {"user_id": "system", "conv_id": source, "request_id": uuid.uuid4().hex, "agent_type": scope}
+
+
 async def _create_tool_manager(cfg):
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from tooling.mcp_client import ToolMCPClient
+    from tooling.tool_manager import MCPToolManager
 
-    manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-    kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-    )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    manager = MCPToolManager()
+    manager.mcp_client = ToolMCPClient(llm_config=cfg)
+    try:
+        await manager.mcp_client.start()
+        manager.attach_mcp(manager.mcp_client)
+        stats = await manager.call("knowledge_stats", {}, _tool_context("admin", "startup"), use_cache=False)
+        if not stats.success:
+            raise RuntimeError(f"MCP 知识服务未就绪: {stats.error}")
+        logger.info("MCP stdio 已连接: %s，知识片段: %s", manager.mcp_client.status(), stats.data["total_chunks"])
+        return manager
+    except BaseException:
+        await manager.close()
+        raise
 
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
 
-    manager.register(Tool(
-        name="knowledge_search",
-        description=("搜索平台知识库，核实退款、发票、物流、账户及技术问题的政策和办理要求。"
-                     "返回文档标题、正文和相关度；这是文档检索，不能查询用户订单或执行退款。"
-                     "query 填搜索主题，top_k 可选，范围 1 到 8。"),
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "top_k": {"type": "integer", "minimum": 1, "maximum": 8},
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-        agent_types=("general", "technical", "billing"),
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
-
-    return manager
+async def _knowledge_call(name, params):
+    if _tool_manager is None:
+        raise HTTPException(503, "工具服务未初始化")
+    result = await _tool_manager.call(name, params, _tool_context("admin", "knowledge-api"), use_cache=False)
+    if not result.success:
+        raise HTTPException(503, result.error or "知识服务调用失败")
+    return result.data
 
 
 @asynccontextmanager
@@ -171,42 +155,42 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    _tool_manager = await _create_tool_manager(cfg)
-    _orchestrator.set_tool_manager(_tool_manager)
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(_memory.close)
+        _tool_manager = await _create_tool_manager(cfg)
+        resources.push_async_callback(_tool_manager.close)
+        _orchestrator.set_tool_manager(_tool_manager)
 
-    # 性能监控（可选启动 Prometheus）
-    prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
-    _monitor = PerformanceMonitor(
-        orchestrator=_orchestrator,
-        tool_manager=_tool_manager,
-        interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
-        webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
-        prometheus_port=prom_port,
-    )
-    await _monitor.start()
+        # 性能监控（可选启动 Prometheus）
+        prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
+        _monitor = PerformanceMonitor(
+            orchestrator=_orchestrator,
+            tool_manager=_tool_manager,
+            interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
+            webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
+            prometheus_port=prom_port,
+        )
+        resources.push_async_callback(_monitor.stop)
+        await _monitor.start()
 
-    # 评测器
-    _evaluator = EndToEndEvaluator(
-        orchestrator=_orchestrator,
-        recognizer=recognizer,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-    )
+        # 评测器
+        _evaluator = EndToEndEvaluator(
+            orchestrator=_orchestrator,
+            recognizer=recognizer,
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+            baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
+        )
 
-    _workflow = ChatWorkflow(_memory, _orchestrator)
-    try:
+        _workflow = ChatWorkflow(_memory, _orchestrator)
+        resources.push_async_callback(_workflow.close)
         await _workflow.start()
         logger.info("LangGraph checkpoint: %s", _workflow.path)
         logger.info("EchoMind 已就绪")
         yield
-    finally:
-        await _workflow.close()
-        _workflow = None
-        await _monitor.stop()
-        await _memory.close()
-        logger.info("EchoMind 已关闭")
+    _workflow = None
+    logger.info("EchoMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -268,7 +252,10 @@ class ChatResponse(BaseModel):
 async def health():
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return {"status": "ok", "agents": _orchestrator.get_stats()}
+    status = await _tool_manager.mcp_client.check_status()
+    if not status["connected"]:
+        raise HTTPException(503, "MCP 工具服务不可用")
+    return {"status": "ok", "agents": _orchestrator.get_stats(), "mcp": status}
 
 
 @app.get("/skills", tags=["Skills"])
@@ -357,12 +344,21 @@ async def prometheus_metrics():
 async def search(query: str, top_k: int = 5):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    此接口主动运行检索优化；聊天里的检索由模型选择工具。
+    此接口主动调用 MCP knowledge_search；聊天里由模型选择同一工具。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    params = {"query": query, "top_k": top_k}
+    try:
+        validate_arguments(CATALOG["knowledge_search"].schema, params)
+    except (ValidationError, ValueError) as ex:
+        raise HTTPException(422, ex.message if isinstance(ex, ValidationError) else str(ex)) from ex
+    result = await _tool_manager.call("knowledge_search", params, _tool_context("general", "search-api"), use_cache=False)
+    if not result.success:
+        raise HTTPException(503, result.error or "知识检索失败")
+    return {"query": query, "results": result.data, "reranked": result.reranked,
+            "retrievals": result.retrievals, "execution_pid": result.receipt["server_pid"],
+            "receipt": result.receipt}
 
 
 class DocInput(BaseModel):
@@ -414,13 +410,8 @@ async def add_knowledge(body: BatchDocInput):
     }
     ```
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
-    total = await kb.doc_count_async()
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
+    data = await _knowledge_call("knowledge_add", {"documents": [d.model_dump() for d in body.documents]})
+    return {"message": f"成功导入 {data['added_chunks']} 个文档片段", **data}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -434,11 +425,6 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     文件大小限制：10MB
     """
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
-
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件大小超过 10MB 限制")
@@ -459,23 +445,24 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = await kb.add_documents_async(docs)
-    total = await kb.doc_count_async()
+    data = await _knowledge_call("knowledge_add", {"documents": docs})
     return {
         "message": f"文件 {filename} 导入成功",
-        "added_chunks": count,
-        "total_chunks": total,
+        **data,
     }
 
 
 @app.get("/knowledge/stats", tags=["知识库"])
 async def knowledge_stats():
     """查看知识库统计信息（文档片段总数）。"""
-    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
-    if tool is None:
-        raise HTTPException(503, "知识库未初始化")
-    kb = tool.handler.__self__
-    return {"total_chunks": await kb.doc_count_async()}
+    return await _knowledge_call("knowledge_stats", {})
+
+
+@app.get("/mcp/status", tags=["MCP"])
+async def mcp_status():
+    if _tool_manager is None:
+        raise HTTPException(503, "工具服务未初始化")
+    return await _tool_manager.mcp_client.check_status()
 
 
 @app.post("/eval/run")
@@ -561,11 +548,15 @@ async def _cli(user_id: str = "cli_user", conv_id: Optional[str] = None):
         model=cfg["model"],
     )
 
-    orch.set_tool_manager(await _create_tool_manager(cfg))
-    conv_id = conv_id or str(uuid.uuid4())
-    print(f"当前会话：{conv_id}（重启时可用 --conv-id 接续）")
-    workflow = ChatWorkflow(mem, orch)
-    try:
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(mem.close)
+        tools = await _create_tool_manager(cfg)
+        resources.push_async_callback(tools.close)
+        orch.set_tool_manager(tools)
+        conv_id = conv_id or str(uuid.uuid4())
+        print(f"当前会话：{conv_id}（重启时可用 --conv-id 接续）")
+        workflow = ChatWorkflow(mem, orch)
+        resources.push_async_callback(workflow.close)
         await workflow.start()
         while True:
             try:
@@ -581,9 +572,6 @@ async def _cli(user_id: str = "cli_user", conv_id: Optional[str] = None):
                     print(f"处理记录：{result['problem_record_error']}\n")
             except (WorkflowConflict, WorkflowExecutionError) as ex:
                 print(f"处理提示：{ex}\n")
-    finally:
-        await workflow.close()
-        await mem.close()
     print("再见 ʕ•ᴥ•ʔ")
 
 
