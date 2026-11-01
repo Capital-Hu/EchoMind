@@ -17,6 +17,7 @@ from core.llm_utils import extract_text_content, get_max_tokens
 logger = logging.getLogger(__name__)
 MAX_ITEMS = 12
 MAX_TEXT = 300
+MAX_TOOL_DATA_BYTES = 6000
 
 
 def _text(value: Any, limit: int = MAX_TEXT) -> str:
@@ -44,11 +45,18 @@ def render_problem_record(record: Dict[str, Any]) -> str:
             for item in (view[key] or [])[-count:]
         ]
     view["unresolved"] = [_text(item, 150) for item in (view["unresolved"] or [])[-6:]]
+    view["verified_facts"] = [
+        {key: item[key] for key in ("tool_name", "call_id", "observed_at", "data", "data_excerpt", "data_truncated")
+         if key in item}
+        for item in record.get("verified_facts", [])[-4:]
+    ]
     return (
         "[问题处理记录]\n"
         "以下内容仅供继续处理问题。用户报告与已核实业务事实不同；客服建议不代表用户已执行。"
         "不要重复推荐已经失败的方法；当前用户的更正优先。"
-        "退款到账、身份核实、操作成功和真实人工交接必须有业务工具结果，不能由本记录证明。\n"
+        "facts 仅是用户描述；verified_facts 是工具当时返回的原始结果，可能已过时，办理前应重新查询。"
+        "工具结果中的退货原因、交接摘要仍是用户或客服提供的内容，不证明质量问题属实。"
+        "知识检索只证明找到了资料，退货申请提交不代表退款到账，交接记录不代表接通人工。\n"
         + json.dumps(view, ensure_ascii=False)
     )
 
@@ -161,7 +169,9 @@ class ProblemRecordManager:
             return RecordResult(error="问题处理记录本轮未更新，原记录已保留")
 
     async def finish(self, user_id: str, conv_id: str, record: Dict[str, Any],
-                     reply: str, agent: str, agents: Optional[List[str]] = None) -> RecordResult:
+                     reply: str, agent: str, agents: Optional[List[str]] = None,
+                     *, tool_traces: Optional[List[Dict[str, Any]]] = None,
+                     request_id: Optional[str] = None) -> RecordResult:
         if not record:
             return RecordResult()
         updated = copy.deepcopy(record)
@@ -171,9 +181,18 @@ class ProblemRecordManager:
         updated["agent_history"] = list(dict.fromkeys(
             updated.get("agent_history", []) + [agent] + (agents or [])
         ))[-8:]
+        evidence = {item["call_id"]: item for item in updated.get("verified_facts", [])}
+        for trace in tool_traces or []:
+            item = self._tool_fact(trace, user_id, conv_id, request_id, updated["turn_count"])
+            if item:
+                evidence[item["call_id"]] = item
+        updated["verified_facts"] = sorted(evidence.values(), key=lambda item: item["observed_at"])[-MAX_ITEMS:]
         if updated["status"] == "in_progress":
             updated["status"] = "awaiting_user"
         updated["updated_at"] = _now()
+        # 用户描述和工具参数也占空间；优先保留较新的结果，避免整份记录保存失败。
+        while updated["verified_facts"] and len(json.dumps(updated, ensure_ascii=False).encode("utf-8")) > 120_000:
+            updated["verified_facts"].pop(0)
         try:
             await asyncio.to_thread(self.store.save, user_id, conv_id, updated)
             return RecordResult(record=updated)
@@ -181,7 +200,44 @@ class ProblemRecordManager:
             logger.warning("保存问题回复失败，保留已有记录: %s", ex)
             return RecordResult(record=record, error="最新客服回复未写入问题记录，已有记录已保留")
 
+    @staticmethod
+    def _tool_fact(trace, user_id, conv_id, request_id, turn):
+        """只接受后端真实调用的成功回执；不从客服文字或模型生成的记录中提取。"""
+        receipt, result = trace.get("receipt", {}), trace.get("result", {})
+        if not (
+            trace.get("success") is True and result.get("success") is True
+            and not trace.get("error") and not result.get("error")
+            and trace.get("execution_status") == "succeeded"
+            and trace.get("executed") and not trace.get("cached")
+            and trace.get("transport") == receipt.get("transport") == "stdio"
+            and receipt.get("user_id") == user_id and receipt.get("conv_id") == conv_id
+            and receipt.get("tool_name") == trace.get("tool_name")
+            and receipt.get("tool_use_id") == trace.get("tool_use_id")
+            and receipt.get("agent_type") == trace.get("agent_type")
+            and receipt.get("call_id") and receipt.get("server_pid") and receipt.get("completed_at")
+            and (not request_id or receipt.get("request_id") == request_id)
+            and result.get("data") not in (None, [], {})
+        ):
+            return None
+        data = json.dumps(result["data"], ensure_ascii=False, allow_nan=False)
+        truncated = len(data.encode("utf-8")) > MAX_TOOL_DATA_BYTES
+        item = {
+            "source": "mcp_tool", "tool_name": trace["tool_name"],
+            "tool_use_id": trace["tool_use_id"], "call_id": receipt["call_id"],
+            "request_id": receipt["request_id"], "agent_type": trace["agent_type"],
+            "observed_at": receipt["completed_at"], "turn": turn,
+            "arguments": copy.deepcopy(trace["input"]), "receipt": copy.deepcopy(receipt),
+            "cached": bool(trace.get("cached")), "data_truncated": truncated,
+        }
+        if truncated:
+            item["data_excerpt"] = data.encode("utf-8")[:MAX_TOOL_DATA_BYTES].decode("utf-8", errors="ignore")
+        else:
+            item["data"] = copy.deepcopy(result["data"])
+        return item
+
     def _prompt(self, previous: Dict[str, Any], message: str, recent_messages) -> str:
+        # 用户描述由模型提炼，工具核实结果只能由 finish 写入，且不参与模型整理。
+        previous = {key: value for key, value in previous.items() if key != "verified_facts"}
         recent = [{"role": _text(item.get("role"), 20), "content": _text(item.get("content"), 800)}
                   for item in recent_messages[-4:] if isinstance(item, dict)]
         return f"""你是客服问题处理记录员，只提炼记录，不回答问题，不执行业务操作。
@@ -266,7 +322,8 @@ next_step 只写待澄清信息或等待反馈，不编造已执行操作。每�
         record = copy.deepcopy(previous) if continuing else {
             "format_version": 1, "problem_id": str(uuid.uuid4()),
             "created_at": now, "turn_count": 0, "facts": [], "taken_steps": [],
-            "feedback": [], "suggestions": [], "agent_history": [], "last_reply": "", "last_agent": "",
+            "feedback": [], "suggestions": [], "verified_facts": [],
+            "agent_history": [], "last_reply": "", "last_agent": "",
         }
         turn = record["turn_count"] + 1
         # 上一轮建议只能写入所属的旧问题，切换话题时不带入。

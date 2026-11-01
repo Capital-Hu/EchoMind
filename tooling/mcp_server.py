@@ -66,7 +66,8 @@ def build_server(knowledge, business, token, audit_path):
             logger.exception("工具执行失败 tool=%s request_id=%s", name, context.get("request_id"))
             error = "工具服务执行失败"
         elapsed = round((time.monotonic() - started) * 1000, 1)
-        receipt = {"server_pid": os.getpid(), "tool_name": name, "transport": "stdio", **public_context}
+        receipt = {"server_pid": os.getpid(), "tool_name": name, "transport": "stdio", **public_context,
+                   "completed_at": datetime.now(timezone.utc).isoformat()}
         state = "unknown" if unknown else "rejected" if not executed else "failed" if error else "succeeded"
         payload = {"success": not bool(error), "data": data, "error": error, "executed": executed, "execution_status": state,
                    "reranked": reranked, "retrievals": retrievals,

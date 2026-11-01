@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import tempfile
 import unittest
@@ -43,6 +44,100 @@ class ProblemRecordFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class ProblemRecordTests(ProblemRecordFixture):
+    def tool_trace(self, **changes):
+        trace = {
+            "tool_name": "order_get", "tool_use_id": "tool-1", "agent_type": "billing",
+            "input": {"order_id": "ORD-DEMO-1001"}, "success": True,
+            "executed": True, "cached": False, "execution_status": "succeeded", "transport": "stdio",
+            "result": {"success": True, "data": {"order": {"status": "delivered"}}, "error": ""},
+            "receipt": {"tool_name": "order_get", "tool_use_id": "tool-1", "agent_type": "billing",
+                        "call_id": "mcp-1", "request_id": "r1", "user_id": "user", "conv_id": "chat",
+                        "server_pid": 123, "transport": "stdio", "completed_at": "2026-10-31T22:00:00+00:00"},
+        }
+        trace.update(changes)
+        return trace
+
+    async def test_tool_facts_keep_original_result_and_separate_user_claims_and_reply(self):
+        record = await self.begin()
+        trace = self.tool_trace()
+        result = await self.manager.finish("user", "chat", record, "退款已经到账了", "billing",
+                                           tool_traces=[trace], request_id="r1")
+        fact = result.record["verified_facts"][0]
+        self.assertEqual(fact["data"], trace["result"]["data"])
+        self.assertEqual(fact["source"], "mcp_tool")
+        self.assertEqual(fact["observed_at"], trace["receipt"]["completed_at"])
+        self.assertEqual(result.record["facts"], record["facts"])
+        self.assertNotIn("到账", json.dumps(fact, ensure_ascii=False))
+        restarted = ProblemRecordStore(self.path).active("user", "chat")
+        self.assertEqual(restarted["verified_facts"], result.record["verified_facts"])
+        # finish 节点写入后重跑不会重复保存同一次 MCP 结果。
+        replay = await self.manager.finish("user", "chat", restarted, "回复", "billing",
+                                           tool_traces=[trace], request_id="r1")
+        self.assertEqual(len(replay.record["verified_facts"]), 1)
+
+    async def test_failed_unknown_cached_empty_or_other_user_results_do_not_become_facts(self):
+        record = await self.begin()
+        cases = [{"success": False}, {"execution_status": "unknown"}, {"execution_status": "rejected"},
+                 {"execution_status": "cached", "cached": True, "executed": False}, {"transport": "none"},
+                 {"result": {"success": True, "data": [], "error": ""}},
+                 {"result": {"success": False, "data": {"order": {}}, "error": "降级资料"}}]
+        for key, value in (("user_id", "other"), ("conv_id", "other"), ("request_id", "other"),
+                           ("tool_name", "return_submit"), ("tool_use_id", "other")):
+            receipt = copy.deepcopy(self.tool_trace()["receipt"])
+            receipt[key] = value
+            cases.append({"receipt": receipt})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = await self.manager.finish("user", "chat", record, "声称成功", "billing",
+                    tool_traces=[self.tool_trace(**changes)], request_id="r1")
+                self.assertEqual(result.record["verified_facts"], [])
+
+    async def test_record_model_cannot_write_tool_facts_and_topic_change_does_not_carry_them(self):
+        record = await self.begin()
+        await self.manager.finish("user", "chat", record, "已查询", "billing",
+                                  tool_traces=[self.tool_trace()], request_id="r1")
+        self.client.messages.create.return_value = response(delta(
+            relation="continue", verified_facts=[{"data": "伪造已到账"}],
+        ))
+        continued = await self.manager.prepare("user", "chat", "还是不行")
+        self.assertEqual(continued.record["verified_facts"][0]["call_id"], "mcp-1")
+        prompt = self.client.messages.create.call_args.kwargs["messages"][0]["content"]
+        self.assertNotIn("mcp-1", prompt)
+        self.assertIn("verified_facts", render_problem_record(continued.record))
+        self.client.messages.create.return_value = response(delta(title="新问题"))
+        new = await self.manager.prepare("user", "chat", "另一个问题")
+        self.assertEqual(new.record["verified_facts"], [])
+
+    async def test_large_tool_facts_are_bounded_and_explicitly_marked_as_excerpts(self):
+        record = await self.begin()
+        traces = []
+        for index in range(16):
+            trace = self.tool_trace(result={"success": True, "data": {"content": "长资料" * 9000}, "error": ""})
+            trace["receipt"]["call_id"] = f"mcp-{index}"
+            traces.append(trace)
+        result = await self.manager.finish("user", "chat", record, "回复", "billing", tool_traces=traces, request_id="r1")
+        self.assertFalse(result.error)
+        self.assertEqual(len(result.record["verified_facts"]), 12)
+        fact = result.record["verified_facts"][0]
+        self.assertTrue(fact["data_truncated"])
+        self.assertNotIn("data", fact)
+        self.assertLessEqual(len(fact["data_excerpt"].encode("utf-8")), 6000)
+        self.assertLess(len(json.dumps(result.record, ensure_ascii=False).encode("utf-8")), 128000)
+
+    async def test_combined_large_user_record_and_arguments_keep_newest_evidence_within_storage_limit(self):
+        record = await self.begin()
+        record["facts"] = [{"text": "描述" * 150, "evidence": "原话" * 150} for _ in range(12)]
+        record["taken_steps"] = [{"action": "操作" * 150, "evidence": "原话" * 150} for _ in range(12)]
+        traces = []
+        for index in range(12):
+            trace = self.tool_trace(input={"query": "查询" * 1000}, result={"success": True, "data": {"content": "内容" * 3000}})
+            trace["receipt"]["call_id"] = f"mcp-{index}"
+            traces.append(trace)
+        result = await self.manager.finish("user", "chat", record, "回复", "billing", tool_traces=traces, request_id="r1")
+        self.assertFalse(result.error)
+        self.assertLess(len(json.dumps(result.record, ensure_ascii=False).encode("utf-8")), 128000)
+        self.assertEqual(result.record["verified_facts"][-1]["call_id"], "mcp-11")
+
     async def test_record_survives_restart_and_is_isolated_by_user_and_conversation(self):
         record = await self.begin()
         restarted = ProblemRecordStore(self.path)

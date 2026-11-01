@@ -267,6 +267,7 @@ class ChatWorkflow:
         recorded = await self.memory.problem_records.finish(
             state["user_id"], state["conv_id"], state["problem_record"],
             result["response"], result["agent_type"], result["agent_types"],
+            tool_traces=result["tool_traces"], request_id=state["request_id"],
         )
         return self._step(state, "save_problem_reply", "problem_saved", problem_record=recorded.record,
                           problem_record_error=state["problem_record_error"] or recorded.error)

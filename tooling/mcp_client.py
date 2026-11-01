@@ -137,7 +137,8 @@ class ToolMCPClient:
                 receipt.get("call_id") != call_id or receipt.get("request_id") != context.get("request_id") or
                 any(receipt.get(key, "") != context.get(key, "") for key in ("user_id", "conv_id", "agent_type", "tool_use_id")) or
                 receipt.get("transport") != "stdio" or
-                receipt.get("tool_name") != name or type(receipt.get("server_pid")) is not int):
+                receipt.get("tool_name") != name or type(receipt.get("server_pid")) is not int or
+                not isinstance(receipt.get("completed_at"), str) or not receipt["completed_at"]):
             self._broken = True
             raise MCPProtocolError("MCP 服务返回结果或回执与请求不一致")
         if payload["execution_status"] == "unknown":

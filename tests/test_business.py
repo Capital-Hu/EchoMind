@@ -12,11 +12,16 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from jsonschema import ValidationError
 
-from agents.agent_orchestrator import GeneralAgent, Request
+from agents.agent_orchestrator import AgentOrchestrator, GeneralAgent, Request
+from agents.chat_workflow import ChatWorkflow
+from core.intent_recognizer import IntentCategory, UrgencyLevel
+from memory.conversation_memory import MemoryContext
+from memory.problem_record import ProblemRecordManager
 from tooling.business_store import BusinessStore
 from tooling.mcp_client import ToolMCPClient
 from tooling.tool_manager import MCPToolManager
 from test_tool_calling import model_response, tool_call
+from test_problem_record import delta, response as problem_response
 
 CONTEXT = {"user_id": "u1001", "conv_id": "business-chat", "request_id": "prepare-request", "call_id": "call-1", "agent_type": "general"}
 PREPARE = {"order_id": "ORD-DEMO-1001", "item_id": "ITEM-DEMO-1001", "reason": "不需要了"}
@@ -328,6 +333,61 @@ class MCPBusinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["path"], str(self.path))
         self.assertNotEqual(response.json()["database"]["server_pid"], os.getpid())
+
+    async def test_http_chat_sqlite_evidence_is_saved_separately_and_survives_checkpoint_retry(self):
+        import api.main as api
+        prep = (await self.call("return_prepare", PREPARE))["data"]["preparation"]
+        model = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=[
+            model_response(tool_call("submit", "return_submit", {"preparation_id": prep["preparation_id"]})),
+            model_response(tool_call("status", "return_status", {"order_id": "ORD-DEMO-1001"})),
+            model_response({"type": "text", "text": "申请提交成功，尚未发起支付退款。"}),
+        ])))
+        orchestrator = AgentOrchestrator(api_key="test", tool_manager=self.manager)
+        for pool in orchestrator._pool.values():
+            for agent in pool:
+                agent._client = model
+        orchestrator.recognize_intent = AsyncMock(return_value=SimpleNamespace(
+            intent=IntentCategory.REFUND, intent_group="billing", urgency=UrgencyLevel.LOW,
+            confidence=0.99, entities={}, source_scores={},
+        ))
+        records = ProblemRecordManager(str(Path(self.temp.name) / "problems.sqlite3"),
+            SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(return_value=problem_response(delta(
+                title="退货", domain="billing", facts=[{"text": "用户确认提交", "evidence": "确认提交"}],
+            ))))), "test")
+        memory = SimpleNamespace(problem_records=records,
+            get_context=AsyncMock(return_value=MemoryContext([
+                SimpleNamespace(role=SimpleNamespace(value="assistant"), content=prep["display_text"]),
+            ], [], {}, "")), save_exchange_once=AsyncMock(), update_profile=AsyncMock())
+        workflow = ChatWorkflow(memory, orchestrator, path=Path(self.temp.name) / "checkpoints.sqlite3")
+        payload = {"message": "确认提交", "user_id": "u1001", "conv_id": "business-chat", "client_request_id": "confirm-http"}
+        try:
+            with patch.object(api, "_workflow", workflow), patch.object(api, "_memory", memory):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
+                    response = await client.post("/chat", json=payload)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    data = response.json()
+                    traces, facts = data["tool_traces"], data["problem_record"]["verified_facts"]
+                    self.assertEqual(len(facts), 2)
+                    self.assertEqual(data["problem_record"]["facts"][0]["source"], "user_message")
+                    self.assertEqual(facts[0]["data"], traces[0]["result"]["data"])
+                    self.assertEqual(facts[0]["arguments"], {"preparation_id": prep["preparation_id"]})
+                    self.assertEqual(facts[0]["data"]["database"]["rows_changed"], 5)
+                    self.assertNotEqual(facts[0]["receipt"]["server_pid"], os.getpid())
+                    with sqlite3.connect(self.path) as db:
+                        row = db.execute("SELECT call_id,rows_changed FROM business_operations WHERE operation_id=?",
+                            (facts[0]["data"]["database"]["operation_id"],)).fetchone()
+                        self.assertEqual(row, (facts[0]["call_id"], 5))
+                    saved = (await client.get("/memory/problems", params={"user_id": "u1001", "conv_id": "business-chat"})).json()
+                    self.assertEqual(saved["records"][0]["verified_facts"], facts)
+                    await workflow.close()
+                    workflow = ChatWorkflow(memory, orchestrator, path=Path(self.temp.name) / "checkpoints.sqlite3")
+                    with patch.object(api, "_workflow", workflow):
+                        retry = (await client.post("/chat", json=payload)).json()
+                    self.assertTrue(retry["workflow"]["cached"])
+                    self.assertEqual(retry["problem_record"]["verified_facts"], facts)
+                    self.assertEqual(model.messages.create.await_count, 3)
+        finally:
+            await workflow.close()
 
 
 if __name__ == "__main__":
