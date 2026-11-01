@@ -13,6 +13,7 @@ import mcp.types as types
 from agents.agent_orchestrator import GeneralAgent, Request
 from tooling.mcp_client import ToolMCPClient, MCPProtocolError, MCPTransportError
 from tooling.tool_manager import MCPToolManager
+from tooling.mcp_protocol import CATALOG
 from test_tool_calling import model_response, tool_call
 
 CONTEXT = {"user_id": "test-user", "conv_id": "chat", "request_id": "mcp-1", "agent_type": "general"}
@@ -43,8 +44,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result["receipt"]["server_pid"], os.getpid())
         self.assertEqual(result["receipt"]["request_id"], CONTEXT["request_id"])
         self.assertEqual(self.client.status()["server_name"], "echomind-tools")
-        self.assertEqual({t.name for t in self.client.tools}, {"knowledge_search", "knowledge_add", "knowledge_stats"})
-        self.assertEqual([t["name"] for t in self.manager.definitions("general")], ["knowledge_search"])
+        self.assertEqual({t.name for t in self.client.tools}, set(CATALOG))
+        self.assertEqual({t["name"] for t in self.manager.definitions("general")},
+                         {name for name, policy in CATALOG.items() if "general" in policy.scopes})
         self.assertTrue((await self.client.check_status())["connected"])
 
     async def test_server_rejects_admin_tools_from_chat_scope(self):

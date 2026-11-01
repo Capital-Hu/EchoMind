@@ -87,6 +87,10 @@ async def _create_tool_manager(cfg):
         stats = await manager.call("knowledge_stats", {}, _tool_context("admin", "startup"), use_cache=False)
         if not stats.success:
             raise RuntimeError(f"MCP 知识服务未就绪: {stats.error}")
+        business = await manager.call("business_stats", {}, _tool_context("admin", "startup"), use_cache=False)
+        if not business.success:
+            raise RuntimeError(f"MCP 业务库未就绪: {business.error}")
+        logger.info("MCP 业务库: %s，订单: %s", business.data["path"], business.data["counts"]["orders"])
         logger.info("MCP stdio 已连接: %s，知识片段: %s", manager.mcp_client.status(), stats.data["total_chunks"])
         return manager
     except BaseException:
@@ -94,12 +98,12 @@ async def _create_tool_manager(cfg):
         raise
 
 
-async def _knowledge_call(name, params):
+async def _admin_tool_call(name, params):
     if _tool_manager is None:
         raise HTTPException(503, "工具服务未初始化")
     result = await _tool_manager.call(name, params, _tool_context("admin", "knowledge-api"), use_cache=False)
     if not result.success:
-        raise HTTPException(503, result.error or "知识服务调用失败")
+        raise HTTPException(503, result.error or "工具服务调用失败")
     return result.data
 
 
@@ -410,7 +414,7 @@ async def add_knowledge(body: BatchDocInput):
     }
     ```
     """
-    data = await _knowledge_call("knowledge_add", {"documents": [d.model_dump() for d in body.documents]})
+    data = await _admin_tool_call("knowledge_add", {"documents": [d.model_dump() for d in body.documents]})
     return {"message": f"成功导入 {data['added_chunks']} 个文档片段", **data}
 
 
@@ -445,7 +449,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    data = await _knowledge_call("knowledge_add", {"documents": docs})
+    data = await _admin_tool_call("knowledge_add", {"documents": docs})
     return {
         "message": f"文件 {filename} 导入成功",
         **data,
@@ -455,7 +459,13 @@ async def upload_knowledge(file: UploadFile = File(...)):
 @app.get("/knowledge/stats", tags=["知识库"])
 async def knowledge_stats():
     """查看知识库统计信息（文档片段总数）。"""
-    return await _knowledge_call("knowledge_stats", {})
+    return await _admin_tool_call("knowledge_stats", {})
+
+
+@app.get("/business/stats", tags=["业务库"])
+async def business_stats():
+    """通过 MCP 查看业务 SQLite 路径、演示数据来源和表数量。"""
+    return await _admin_tool_call("business_stats", {})
 
 
 @app.get("/mcp/status", tags=["MCP"])

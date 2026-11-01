@@ -19,6 +19,7 @@ logs/
 
 data/chroma/
 data/workflow/
+data/business/
 data/**/*.sqlite3
 data/.DS_Store
 

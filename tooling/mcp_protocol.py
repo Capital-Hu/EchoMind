@@ -15,6 +15,15 @@ class ToolPolicy:
     cache_ttl: float = 0
 
 
+def _business_tool(description, properties=None, required=(), *, write=False, scopes=None):
+    return ToolPolicy(description,
+        {"type": "object", "properties": properties or {}, "required": list(required), "additionalProperties": False},
+        scopes or (("general", "billing") if write else ("general", "technical", "billing")), timeout=15)
+
+
+_ID = {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Z0-9][A-Z0-9-]*$"}
+_TEXT = {"type": "string", "minLength": 1, "maxLength": 500, "pattern": r"\S"}
+
 CATALOG = {
     "knowledge_search": ToolPolicy(
         "搜索平台知识库，核实政策、业务规则和办理要求。返回文档标题、正文和相关度；不能查询用户订单或执行退款。",
@@ -39,6 +48,30 @@ CATALOG = {
         "知识管理接口使用：读取知识库文档片段数量。",
         {"type": "object", "properties": {}, "additionalProperties": False}, ("admin",),
     ),
+    "customer_lookup": _business_tool("定位当前聊天用户关联的业务客户资料；身份由后端提供，不能查询其他用户。"),
+    "order_list": _business_tool("查询当前用户的订单列表、商品明细、实付单价（分）和剩余可退数量。"),
+    "order_get": _business_tool("查询当前用户某个订单的实际状态和商品明细。", {"order_id": _ID}, ("order_id",)),
+    "product_get": _business_tool("根据商品编号查询商品介绍与标价（分）；退款金额以订单实付为准。", {"product_id": _ID}, ("product_id",)),
+    "return_prepare": _business_tool(
+        "准备一件订单明细的退货申请，校验归属、数量、已签收和购买后7天自助期限；写入待确认明细，尚未正式提交。"
+        "必须完整原样展示返回的 display_text，等待用户下一轮明确确认后才能 return_submit。",
+        {"order_id": _ID, "item_id": _ID, "quantity": {"type": "integer", "minimum": 1, "maximum": 99, "default": 1},
+         "reason": _TEXT, "reason_code": {"type": "string", "enum": ["unwanted", "quality_issue", "other"], "default": "unwanted"}},
+        ("order_id", "item_id", "reason"), write=True),
+    "return_submit": _business_tool(
+        "正式提交已展示且由用户在下一轮确认的待退货明细。只接受 preparation_id，不能代用户确认。"
+        "服务端检查用户原话与上一轮明细；重复提交返回同一退货编号，不会重复写入。仅创建退货申请，不执行支付退款。",
+        {"preparation_id": _ID}, ("preparation_id",), write=True),
+    "return_status": _business_tool(
+        "查询当前用户的退货申请、事件和当前聊天待确认明细；不传参数可找回待确认 preparation_id。"
+        "支持按订单号或退货编号筛选；提交状态不等于款项到账。", {"order_id": _ID, "return_id": _ID}),
+    "handoff_create": _business_tool(
+        "将交接原因和处理摘要真实写入 SQLite。同一用户同一聊天同一订单重复调用返回同一条记录。"
+        "只记录交接申请，未连接人工客服；摘要是客服整理的信息，不代表工具核实的事实。",
+        {"reason": _TEXT, "summary": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": r"\S"}, "order_id": _ID},
+        ("reason", "summary")),
+    "handoff_status": _business_tool("查询当前用户当前聊天已记录的人工交接申请；recorded 不表示已接通人工。"),
+    "business_stats": _business_tool("管理接口使用：查询业务库路径、演示数据来源和业务表数量。", scopes=("admin",)),
 }
 
 
@@ -65,4 +98,9 @@ def parse_meta(meta, expected_token):
     tool_use_id = context.get("tool_use_id", "")
     if not isinstance(tool_use_id, str) or len(tool_use_id) > 512:
         raise ValueError("工具调用编号无效")
+    for key, maximum in (("user_message", 20000), ("previous_reply", 32000)):
+        value = context.get(key, "")
+        if not isinstance(value, str) or len(value) > maximum:
+            raise ValueError(f"工具调用上下文字段无效: {key}")
+        clean[key] = value
     return {**clean, "tool_use_id": tool_use_id}

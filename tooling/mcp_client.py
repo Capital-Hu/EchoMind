@@ -48,7 +48,7 @@ class ToolMCPClient:
         self.call_count = 0
 
     def _env(self):
-        config = {key: os.environ[key] for key in ("CHROMA_HOST", "CHROMA_PORT", "CHROMA_PERSIST_DIRECTORY", "LOG_LEVEL")
+        config = {key: os.environ[key] for key in ("CHROMA_HOST", "CHROMA_PORT", "CHROMA_PERSIST_DIRECTORY", "LOG_LEVEL", "BUSINESS_DB_PATH")
                   if key in os.environ}
         if self.llm_config:
             config.update({"ANTHROPIC_API_KEY": self.llm_config["api_key"], "ANTHROPIC_MODEL": self.llm_config["model"]})

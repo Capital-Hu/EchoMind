@@ -85,10 +85,12 @@ services:
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - ECHOMIND_SKILLS_DIR=/app/skills
       - WORKFLOW_CHECKPOINT_PATH=/app/data/workflow/checkpoints.sqlite3
+      - BUSINESS_DB_PATH=/app/data/business/business.sqlite3
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
       - ./data/workflow:/app/data/workflow
+      - ./data/business:/app/data/business
       - ./skills:/app/skills
       - ./logs:/app/logs
     depends_on:

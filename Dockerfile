@@ -50,8 +50,8 @@ COPY --from=model-assets --chown=echomind:echomind /root/.cache/chroma /home/ech
 COPY --chown=echomind:echomind . .
 
 # 创建必要目录，只调整运行期需要写入的目录权限，避免递归 chown 整个应用。
-RUN mkdir -p /app/data/chroma /app/data/workflow /app/logs /app/config && \
-    chown echomind:echomind /app/data /app/data/chroma /app/data/workflow /app/logs /app/config
+RUN mkdir -p /app/data/chroma /app/data/workflow /app/data/business /app/logs /app/config && \
+    chown echomind:echomind /app/data /app/data/chroma /app/data/workflow /app/data/business /app/logs /app/config
 USER echomind
 
 EXPOSE 8000
@@ -68,7 +68,7 @@ COPY --from=model-assets /root/.cache/chroma /root/.cache/chroma
 
 COPY . .
 
-RUN mkdir -p /app/data/chroma /app/data/workflow /app/logs /app/config /app/tests && \
+RUN mkdir -p /app/data/chroma /app/data/workflow /app/data/business /app/logs /app/config /app/tests && \
     chmod -R 777 /app/data /app/logs
 
 EXPOSE 8000

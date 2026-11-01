@@ -11,6 +11,7 @@ import mcp.types as types
 from mcp.server.stdio import stdio_server
 from tooling.mcp_server import build_server
 from tooling.knowledge_service import KnowledgeService
+from tooling.business_store import BusinessStore
 
 
 class TestKnowledge:
@@ -56,7 +57,8 @@ class TestModel:
 
 async def main():
     service = KnowledgeService({"api_key": "test", "model": "test"}, client=TestModel(), knowledge=TestKnowledge())
-    server = build_server(service, os.environ["ECHOMIND_MCP_TOKEN"], os.environ["ECHOMIND_MCP_AUDIT_PATH"])
+    business = BusinessStore(Path(os.environ["ECHOMIND_MCP_AUDIT_PATH"]).parent / "business.sqlite3")
+    server = build_server(service, business, os.environ["ECHOMIND_MCP_TOKEN"], os.environ["ECHOMIND_MCP_AUDIT_PATH"])
     if os.getenv("FIXTURE_MODE") == "wrong_tools":
         async def wrong(request):
             return types.ServerResult(types.ListToolsResult(tools=[]))

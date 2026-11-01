@@ -1,0 +1,31 @@
+{
+  "source": "EchoMind 项目自行编写的虚构演示数据，不来自真实用户或支付系统",
+  "version": "echomind-business-demo-v1",
+  "customers": [
+    {"customer_id": "C1001", "app_user_id": "u1001", "name": "演示用户小林", "email": "lin@example.invalid"},
+    {"customer_id": "C1002", "app_user_id": "u1002", "name": "演示用户小周", "email": "zhou@example.invalid"}
+  ],
+  "products": [
+    {"product_id": "P1001", "name": "Echo 蓝牙耳机", "description": "演示商品：蓝牙连接、USB-C 充电，附充电盒。", "price_cents": 19900},
+    {"product_id": "P1002", "name": "Echo 保温杯", "description": "演示商品：500 毫升不锈钢保温杯。", "price_cents": 8900},
+    {"product_id": "P1003", "name": "Echo 帆布包", "description": "演示商品：可水洗帆布手提包。", "price_cents": 5900}
+  ],
+  "orders": [
+    {"order_id": "ORD-DEMO-1001", "customer_id": "C1001", "status": "delivered", "days_since_delivery": 3, "items": [
+      {"item_id": "ITEM-DEMO-1001", "product_id": "P1001", "quantity": 1, "unit_paid_cents": 19900}
+    ]},
+    {"order_id": "ORD-DEMO-1002", "customer_id": "C1001", "status": "delivered", "days_since_delivery": 2, "items": [
+      {"item_id": "ITEM-DEMO-1002", "product_id": "P1002", "quantity": 2, "unit_paid_cents": 7900},
+      {"item_id": "ITEM-DEMO-1003", "product_id": "P1003", "quantity": 1, "unit_paid_cents": 5900}
+    ]},
+    {"order_id": "ORD-DEMO-1003", "customer_id": "C1001", "status": "shipped", "days_since_delivery": null, "items": [
+      {"item_id": "ITEM-DEMO-1004", "product_id": "P1003", "quantity": 1, "unit_paid_cents": 5900}
+    ]},
+    {"order_id": "ORD-DEMO-1004", "customer_id": "C1001", "status": "delivered", "days_since_delivery": 40, "items": [
+      {"item_id": "ITEM-DEMO-1005", "product_id": "P1002", "quantity": 1, "unit_paid_cents": 8900}
+    ]},
+    {"order_id": "ORD-DEMO-2001", "customer_id": "C1002", "status": "delivered", "days_since_delivery": 1, "items": [
+      {"item_id": "ITEM-DEMO-2001", "product_id": "P1001", "quantity": 1, "unit_paid_cents": 19900}
+    ]}
+  ]
+}

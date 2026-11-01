@@ -28,6 +28,9 @@ EchoMind/
 ├── memory/problem_record.py       # 按问题保存用户反馈、已尝试方法及接手 Agent
 ├── tooling/tool_manager.py        # MCP 工具注册、范围检查、缓存与请求转发
 ├── tooling/knowledge_service.py   # MCP Server 调用的知识库业务实现与完整增强检索
+├── tooling/business_store.py      # MCP Server 持有的业务 SQLite、事务、归属与确认检查
+├── tooling/business_schema.sql    # 客户、商品、订单、退货、交接与操作记录表
+├── fixtures/business_demo.json    # 项目编写的虚构演示业务数据
 ├── tooling/mcp_client.py          # 官方 SDK 的 stdio 客户端与子进程生命周期
 ├── tooling/mcp_server.py          # 独立 MCP 工具进程
 ├── tooling/mcp_protocol.py        # 工具 Schema、调用范围与上下文合同
@@ -263,6 +266,7 @@ http://localhost/docs
 | `POST` | `/knowledge/add` | JSON Body | 批量导入文档到 ChromaDB 知识库 | 程序化导入文档 |
 | `POST` | `/knowledge/upload` | Form File | 上传 `.txt`、`.md`、`.json` 文件导入知识库 | 手动上传知识库文件 |
 | `GET` | `/knowledge/stats` | 无 | 查看知识库文档片段总数 | 确认知识库是否有数据 |
+| `GET` | `/business/stats` | 无 | 通过 MCP 查看业务 SQLite 路径、来源与表数量 | 核对业务库和持久化结果 |
 | `POST` | `/eval/run` | 无 | 运行内置意图识别和端到端对话评测 | 演示 LLM-as-Judge 评测 |
 | `GET` | `/docs` | 浏览器访问 | Swagger UI | 浏览和调试所有接口 |
 
@@ -383,7 +387,7 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 [Anthropic 工具定义](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)与
 [DeepSeek Anthropic 兼容协议](https://api-docs.deepseek.com/guides/anthropic_api/)。
 
-当前提供 `knowledge_search`，读取现有 ChromaDB 知识库。聊天不再按关键词提前检索：
+当前提供知识检索和 SQLite 业务工具，模型可查询当前用户订单、准备并提交退货、查询进度和记录交接。聊天不再按关键词提前检索：
 模型自行决定是否检索、搜索什么、取多少条，以及是否调整查询再次检索。
 前端演示 `/search` 和模型的 `knowledge_search` 都把完整请求交给同一个 MCP Server，
 由工具子进程内唯一的 `KnowledgeService` 实例完成改写、召回、去重与重排，再一次性返回结果。
@@ -421,7 +425,7 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 缓存保存 Server 返回的最终增强检索结果与完整调用回执，命中时不重复发起 MCP 调用。
 这些证据也随 Agent 结果存入 checkpoint，成功请求重试时直接返回原证据。
 
-工具通过真正的 MCP stdio Client/Server 执行。订单退款业务库与前端证据面板待后续接入。
+工具通过真正的 MCP stdio Client/Server 执行。业务库操作真实持久化；支付退款系统和专用前端证据面板尚未接入。
 
 ### MCP stdio 工具服务
 
@@ -444,8 +448,16 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 | `knowledge_search` | general / technical / billing | 聊天工具，Server 完整执行增强检索 |
 | `knowledge_add` | admin | 现有知识导入、文件上传接口 |
 | `knowledge_stats` | admin | 启动检查、现有知识统计接口 |
+| `customer_lookup` | general / technical / billing | 定位当前后台用户关联的客户 |
+| `order_list` / `order_get` | general / technical / billing | 当前用户订单列表与明细 |
+| `product_get` | general / technical / billing | 商品介绍、标价 |
+| `return_prepare` / `return_submit` | general / billing | 准备退货、用户下一轮确认后正式提交 |
+| `return_status` | general / technical / billing | 读取实际退货进度和当前聊天待确认明细 |
+| `handoff_create` / `handoff_status` | general / technical / billing | 持久化交接申请和查询记录 |
+| `business_stats` | admin | 业务库路径、来源与表数量 |
 
-聊天模型只看到检索工具。调用范围、用户编号、会话编号、请求编号和模型工具调用编号，
+共 13 个 MCP 工具，general / billing 模型可见其中 10 个，technical 不开放准备和提交退货。
+调用范围、用户编号、会话编号、请求编号和模型工具调用编号，
 由后端通过 MCP `_meta` 传递，模型参数不能覆盖。子进程会验证每次启动生成的私有会话凭据；
 Server 通过显式白名单接收现有模型配置（API Key、模型名、Base URL、CLAUDE_MAX_TOKENS），
 用于自己发起改写和重排的模型请求；不继承 Redis 配置。这是后端与工具进程的范围检查，现有 HTTP 接口尚未提供账户登录鉴权。
@@ -461,6 +473,72 @@ Server 通过显式白名单接收现有模型配置（API Key、模型名、Bas
 回执包含 `server_pid`、`call_id`、`request_id`、`tool_use_id`，可与服务端日志相互核对。
 缓存命中时不会再次发起 MCP 调用，`cached=true`、`executed=false`，保留原调用回执。
 成功请求的工具证据仍随 checkpoint 保存。
+
+### 业务 SQLite 与退货链路
+
+业务操作全部在 MCP Server 中执行固定的参数化 SQL，主程序不直接打开业务 SQLite，也不向模型提供任意 SQL 执行工具。
+`knowledge_*` 交给 `KnowledgeService`，其余业务工具交给 `BusinessStore`。启动时自动建表和导入一次演示数据。
+
+| 项目 | 路径或说明 |
+|---|---|
+| 宿主机业务库 | `./data/business/business.sqlite3` |
+| 容器内路径 | `/app/data/business/business.sqlite3` |
+| Docker 挂载 | `./data/business:/app/data/business`，SQLite、WAL 和 SHM 一起保留 |
+| 本地配置 | `BUSINESS_DB_PATH`，默认指向项目 `data/business`；Docker compose 固定为容器内路径 |
+| 表结构 | `tooling/business_schema.sql` |
+| 数据来源 | `fixtures/business_demo.json`，项目自行编写的虚构数据，不来自真实用户、支付系统或参考项目的数据集 |
+| 导入规则 | 首次初始化记录来源版本、SHA256、时间；再次启动不重置订单或覆盖退货记录 |
+
+业务表为 `customers`、`products`、`orders`、`order_items`、`return_preparations`、`returns`、`return_events`、`handoffs`，
+另有 `business_meta` 保存来源、`business_operations` 保存每次成功业务工具操作的请求、调用编号、执行 PID 和变更行数。
+工具结果中的 `data.database` 可与 MCP 回执、`logs/mcp-tools.jsonl` 和 SQLite 操作记录相互核对。
+`rows_changed` 不计算操作日志自身；重复提交会增加调用日志，但不会增加退货单、事件或已退数量。
+
+演示账号与订单：
+
+| API / 前端 user_id | 订单 | 首次初始化状态 |
+|---|---|---|
+| `u1001`（前端默认） | `ORD-DEMO-1001` | 已签收，耳机 1 件，实付 199.00 元 |
+| `u1001` | `ORD-DEMO-1002` | 已签收，保温杯 2 件，每件实付 79.00 元；帆布包 1 件 |
+| `u1001` | `ORD-DEMO-1003` | 已发货未签收，用于验证拒绝自助退货 |
+| `u1001` | `ORD-DEMO-1004` | 已超过自助期限，用于验证交接处理 |
+| `u1002` | `ORD-DEMO-2001` | 另一用户的已签收订单，用于验证归属隔离 |
+
+日期按第一次导入时间生成后固定保存，之后会正常过期。金额按整数“分”存储，退货按订单实付而非商品标价计算。
+当前自助范围为已签收且购买后7天内；超期和质量争议记录交接申请，由人工核实。只记录交接，不连接真实人工。
+用户归属来自后端 `user_id`，业务工具参数不能覆盖；当前仍沿用演示接口身份，尚无真实账户登录鉴权。
+
+完整流程：
+
+```text
+用户提出退货
+  -> 模型选择 customer_lookup / order_list / order_get / product_get
+  -> 模型调用 return_prepare，SQLite 保存待确认明细（30分钟有效）
+  -> 模型完整原样展示 preparation.display_text，等待下一轮
+用户明确确认
+  -> 模型调用 return_status 找回 preparation_id，再调用 return_submit
+  -> Server 核对后端传来的本轮用户原话、上一轮展示内容、用户与会话、实付金额和剩余数量
+  -> 单个 BEGIN IMMEDIATE 事务写退货单和事件，更新已退数量、订单退货状态、待确认状态
+  -> 模型再次调用 return_status，核对落库结果再回答
+重复提交同一 preparation_id
+  -> 返回同一 return_id、replayed=true、rows_changed=0
+```
+
+确认信息只由后端通过私有 `_meta` 提供，模型没有 `confirmed=true`、确认原话或身份覆盖参数。
+Server 要求上一轮完整展示明细，拒绝准备与提交发生在同一请求；“不确认”、引用确认话术等不会触发提交。
+一份待确认明细时可以回复“确认提交”；多份明细并存时需回复对应的 `confirmation_text`。
+已提交的同一编号可安全重试，数据库唯一约束和事务同时防止并发重复写入；写入途中失败会整体回滚。
+业务工具不缓存，每次查询都读取 SQLite 最新状态。超时或连接中断仍标记结果未确认，不能由模型推断成功。
+
+Swagger `/chat` 可使用以下第一轮请求：
+
+```json
+{"user_id":"u1001","conv_id":"business-demo-1","client_request_id":"business-prepare-1","message":"我想退 ORD-DEMO-1001 的耳机，不需要了，请帮我准备退货。"}
+```
+
+看到完整明细后，使用同一 `user_id`、`conv_id` 和新的 `client_request_id` 发送“确认提交”。
+查看 `tool_traces` 中的真实参数、`result.data.database`、`receipt.server_pid` 及退货编号；
+再发送“查询这笔退货进度”，或使用 `GET /business/stats` 查看表数量。退款状态保持 `not_issued`，未调用真实支付系统。
 
 可以在 Swagger 或以下接口查看实时连接状态：
 
@@ -536,8 +614,8 @@ curl -X POST http://localhost:8000/workflow/resume \
 CLI 可通过 `python -m api.main --cli --conv-id chat-1` 接续会话，输入 `/resume` 恢复。
 用户画像仍在回复后后台更新，不属于这条可恢复流程。
 
-这一阶段保存现有聊天流程的进度，尚未接入真实 MCP 退款或订单写操作。
-后续接入业务工具时，仍需为每项写操作实现业务去重和结果核查；checkpoint 本身不能保证外部操作只执行一次。
+聊天流程保存节点进度，业务写操作在独立 MCP Server 中执行，并通过业务唯一约束实现重复提交去重。
+工具循环仍作为整个 Agent 节点保存，checkpoint 本身不能保证外部操作只执行一次；退货提交需使用原 preparation_id 重试和查询核对。
 当前锁只覆盖单个应用进程，不支持多个应用实例同时处理同一会话。
 
 ### 5.5 `/search`
