@@ -13,6 +13,7 @@ class ToolPolicy:
     scopes: tuple[str, ...]
     timeout: float = 30
     cache_ttl: float = 0
+    invalidates_cache_for: tuple[str, ...] = ()
 
 
 def _business_tool(description, properties=None, required=(), *, write=False, scopes=None):
@@ -42,7 +43,7 @@ CATALOG = {
                 "content": {"type": "string", "minLength": 1, "maxLength": 50000},
             }, "required": ["title", "content"], "additionalProperties": False},
         }}, "required": ["documents"], "additionalProperties": False},
-        ("admin",), timeout=60,
+        ("admin",), timeout=60, invalidates_cache_for=("knowledge_search",),
     ),
     "knowledge_stats": ToolPolicy(
         "知识管理接口使用：读取知识库文档片段数量。",

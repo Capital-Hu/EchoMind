@@ -115,6 +115,7 @@ class Tool:
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
     agent_types: tuple[str, ...] = ()        # 显式声明哪些 Agent 可从模型调用；默认不暴露
     transport: str = "local"
+    invalidates_cache_for: tuple[str, ...] = ()  # 成功执行后失效的工具缓存
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -132,7 +133,8 @@ class MCPToolManager:
 
     def __init__(self):
         self._tools: Dict[str, Tool] = {}
-        self._cache: Dict[str, tuple] = {}   # key → (完整工具结果, expire_at)
+        self._cache: Dict[tuple[str, str], tuple] = {}  # (工具名, 请求摘要) → (结果, 过期时间)
+        self._cache_versions: Dict[str, int] = {}
         self.mcp_client = None
 
     def attach_mcp(self, client):
@@ -145,7 +147,7 @@ class MCPToolManager:
             self.register(Tool(name, discovered.description, invoke, discovered.inputSchema,
                                cache_ttl=policy.cache_ttl, timeout_s=policy.timeout + 5,
                                agent_types=policy.scopes,
-                               transport="stdio"))
+                               transport="stdio", invalidates_cache_for=policy.invalidates_cache_for))
 
     async def _call_mcp(self, name, params, context):
         """转交一个完整工具请求，接收 Server 的最终结果及内部检索记录。"""
@@ -226,6 +228,7 @@ class MCPToolManager:
             return await self._fallback_result(tool, params, context, error)
 
         t0 = time.monotonic()
+        cache_version = self._cache_versions.get(name, 0)
         tool.stats.total += 1
         try:
             data = await asyncio.wait_for(self._run_handler(tool, params, context), timeout=tool.timeout_s)
@@ -245,8 +248,11 @@ class MCPToolManager:
             tool.stats.total_latency_ms += latency
             tool.breaker.record_success()
 
-            # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
-            if tool.cache_ttl > 0:
+            if tool.invalidates_cache_for:
+                self._invalidate_caches(tool.invalidates_cache_for)
+
+            # 缓存失效前发出的调用可能返回旧结果，跳过回写。
+            if tool.cache_ttl > 0 and cache_version == self._cache_versions.get(name, 0):
                 self._set_cache(name, params, result, tool.cache_ttl, context)
 
             return result
@@ -325,10 +331,17 @@ class MCPToolManager:
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, name: str, params: Dict, context=None) -> str:
+    def _invalidate_caches(self, names: tuple[str, ...]) -> None:
+        for name in names:
+            self._cache_versions[name] = self._cache_versions.get(name, 0) + 1
+        for key in list(self._cache):
+            if key[0] in names:
+                del self._cache[key]
+
+    def _cache_key(self, name: str, params: Dict, context=None) -> tuple[str, str]:
         scope = {k: v for k, v in context.items() if k != "tool_use_id"} if context else context
         payload = {"params": params, "context": scope}
-        return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
+        return name, hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def _get_cache(self, name, params, context=None):
         key = self._cache_key(name, params, context)

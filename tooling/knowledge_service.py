@@ -1,4 +1,4 @@
-"""MCP Server 使用的知识库业务实现：查询改写、检索、去重与重排。"""
+"""MCP Server 的知识库检索流程：查询改写、混合召回、融合与重排。"""
 import asyncio
 import json
 import logging
@@ -9,9 +9,12 @@ from typing import Any, Dict, List, Tuple
 from anthropic import AsyncAnthropic
 from jsonschema import ValidationError
 from core.llm_utils import extract_text_content, get_max_tokens
+from tooling.hybrid_retrieval import rrf
 from tooling.mcp_protocol import CATALOG, validate_arguments
 
 logger = logging.getLogger(__name__)
+_CANDIDATE_LIMIT = 20
+_RERANK_TIMEOUT = 30
 
 
 @dataclass
@@ -49,6 +52,9 @@ class KnowledgeService:
 
     async def _retrieve(self, query, top_k):
         return await (await self.get()).search_async(query, top_k)
+
+    async def _retrieve_bm25(self, query, top_k):
+        return await (await self.get()).search_bm25_async(query, top_k)
 
     async def call(self, name, arguments, context):
         if name == "knowledge_search":
@@ -109,11 +115,10 @@ class KnowledgeService:
         query: str,
         top_k: int = 5,
     ) -> SearchResult:
-        """
-        完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
-
-        这是解决"检索不全、召回不好"的完整方案。
-        """
+        """原始问题走 BM25，原始问题及改写走向量召回，最后融合与重排。"""
+        loop = asyncio.get_running_loop()
+        # 在 MCP 总超时之前留出时间返回已经完成的融合结果。
+        rerank_deadline = loop.time() + CATALOG["knowledge_search"].timeout - 1
         try:
             validate_arguments(CATALOG["knowledge_search"].schema, {"query": query, "top_k": top_k})
         except ValidationError as ex:
@@ -122,39 +127,32 @@ class KnowledgeService:
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
-        # 2. 并行召回：所有子查询同时检索
-        recall_k = max(top_k, 5)
-        tasks = [
-            self._retrieve(q, recall_k)
-            for q in sub_queries
-        ]
+        # 2. 向量检索使用改写；BM25 保留原始问题中的错误码、型号等词项。
+        channels = [(q, "vector") for q in sub_queries] + [(query, "bm25")]
+        tasks = [self._retrieve(q, _CANDIDATE_LIMIT) for q in sub_queries]
+        tasks.append(self._retrieve_bm25(query, _CANDIDATE_LIMIT))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        retrievals = [{"query": q, "success": not isinstance(r, BaseException),
+        retrievals = [{"query": q, "channel": channel, "success": not isinstance(r, BaseException),
                        "error": str(r) if isinstance(r, BaseException) else "",
                        "result_count": len(r) if isinstance(r, list) else 0,
                        "execution_pid": os.getpid()}
-                      for q, r in zip(sub_queries, results)]
+                      for (q, channel), r in zip(channels, results)]
         if any(isinstance(r, BaseException) for r in results):
             return SearchResult(False, [], error="部分知识检索失败，本次增强检索未完成", retrievals=retrievals)
 
-        # 3. 合并去重（按文档内容去重）
-        seen, merged = set(), []
-        for r in results:
-            if isinstance(r, list):
-                for item in r:
-                    # 同一文档在不同查询下分数会变化，去重不包含 score。
-                    identity = {key: item.get(key) for key in ("title", "content", "chunk")} if isinstance(item, dict) else item
-                    key = json.dumps(identity, sort_keys=True, ensure_ascii=False)
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+        # 3. 按切片 ID 合并排名，限制发送给重排模型的候选数量。
+        vector_rankings, bm25_ranking = results[:-1], results[-1]
+        candidates = rrf(vector_rankings, bm25_ranking, _CANDIDATE_LIMIT)
+        if len(candidates) <= top_k:
+            return SearchResult(True, candidates, retrievals=retrievals)
 
-        if not merged:
-            return SearchResult(True, [], retrievals=retrievals)
-
-        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        data, reranked = await self._rerank(query, merged, top_k)
+        timeout = max(0, min(_RERANK_TIMEOUT, rerank_deadline - loop.time()))
+        try:
+            data, reranked = await asyncio.wait_for(self._rerank(query, candidates, top_k), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("重排超时，按 RRF 顺序返回")
+            data, reranked = candidates[:top_k], False
         return SearchResult(True, data, reranked=reranked, retrievals=retrievals)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
@@ -166,12 +164,11 @@ class KnowledgeService:
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
         """
-        if len(items) <= top_k:
-            return items, False
-
         # 将结果序列化为文本供 LLM 评分
-        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-                               for i, item in enumerate(items))
+        items_text = "\n".join(
+            f"{i}. {item.get('title', '')[:100]}: {item.get('content', '')[:200]}"
+            for i, item in enumerate(items)
+        )
         prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
 用户查询: "{query}"
 检索结果:
@@ -196,6 +193,6 @@ class KnowledgeService:
             indices = list(dict.fromkeys(order + list(range(len(items)))))
             return [items[i] for i in indices[:top_k]], True
         except Exception as ex:
-            logger.warning(f"重排失败，返回原始顺序: {ex}")
+            logger.warning(f"重排失败，按 RRF 顺序返回: {ex}")
             return items[:top_k], False
 

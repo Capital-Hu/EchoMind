@@ -14,9 +14,12 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 import chromadb
+
+from tooling.hybrid_retrieval import BM25Index
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,8 @@ class KnowledgeBase:
             name=self.COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
         )
+        self._bm25_lock = Lock()
+        self._bm25_index: Optional[BM25Index] = None
 
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
@@ -92,7 +97,9 @@ class KnowledgeBase:
 
         if ids:
             # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            with self._bm25_lock:
+                self._collection.add(ids=ids, documents=docs, metadatas=metas)
+                self._bm25_index = None
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
@@ -114,16 +121,18 @@ class KnowledgeBase:
 
         items = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            for chunk_id, doc, meta, dist in zip(
+                results["ids"][0],
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
                 items.append({
-                    "title":    meta.get("title", ""),
+                    "chunk_id": chunk_id,
+                    "title":    (meta or {}).get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
-                    "chunk":    meta.get("chunk_index", 0),
+                    "chunk":    (meta or {}).get("chunk_index", 0),
                 })
 
         return items
@@ -131,6 +140,30 @@ class KnowledgeBase:
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.search, query, top_k)
+
+    def _load_bm25_index(self) -> BM25Index:
+        chunks = []
+        page_size = 1000
+        offset = 0
+        while True:
+            page = self._collection.get(limit=page_size, offset=offset, include=["documents", "metadatas"])
+            for chunk_id, doc, meta in zip(page["ids"], page["documents"], page["metadatas"]):
+                metadata = meta or {}
+                chunks.append({"chunk_id": chunk_id, "title": metadata.get("title", ""),
+                               "content": doc or "", "chunk": metadata.get("chunk_index", 0)})
+            if len(page["ids"]) < page_size:
+                return BM25Index(chunks)
+            offset += page_size
+
+    def search_bm25(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        with self._bm25_lock:
+            if self._bm25_index is None:
+                self._bm25_index = self._load_bm25_index()
+            index = self._bm25_index
+        return index.search(query, top_k)
+
+    async def search_bm25_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.search_bm25, query, top_k)
 
     @property
     def doc_count(self) -> int:

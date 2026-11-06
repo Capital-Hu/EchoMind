@@ -260,7 +260,7 @@ http://localhost/docs
 | `GET` | `/workflow/status` | Query 参数 | 查看当前请求已保存的进度与下一步 | 排查中断位置 |
 | `POST` | `/workflow/resume` | JSON Body | 从持久化进度继续最后一条未完成请求 | 重启或异常后恢复 |
 | `GET` | `/monitor` | 无 | 查看 Agent/工具统计、告警和优化建议 | 观察在线表现 |
-| `POST` | `/search` | Query 参数 | 执行知识库检索优化链路：查询改写、并行召回、合并去重、LLM 重排 | 测试 RAG 检索 |
+| `POST` | `/search` | Query 参数 | 查询改写、向量与 BM25 召回、RRF 融合、LLM 重排 | 测试 RAG 检索 |
 | `GET` | `/skills` | 无 | 查看当前加载的 Skills、匹配关键词和解析错误 | 确认动态能力是否生效 |
 | `POST` | `/skills/reload` | 无 | 运行时重新扫描 Skill 目录 | 修改业务规则后热加载 |
 | `POST` | `/knowledge/add` | JSON Body | 批量导入文档到 ChromaDB 知识库 | 程序化导入文档 |
@@ -397,7 +397,7 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 模型收到工具定义与用户问题
   -> 返回 tool_use（例如 knowledge_search，query="退款审核及到账时间"）
   -> 后端校验参数，把完整搜索请求交给 MCP Server
-  -> Server 内调用 search_with_rewrite：改写、多路查库、合并去重与重排
+  -> Server 内调用 search_with_rewrite：改写、向量与 BM25 召回、RRF 融合与重排
   -> 回传 tool_result（真实文档或错误）
   -> 模型继续决策，最终生成回复
 ```
@@ -420,9 +420,9 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 
 查看响应中的 `tools_used` 和 `tool_traces`。每个 trace 包含模型返回的 `tool_use_id`、
 `input` 参数、`executed`（是否进入 handler）、`success`、`result`、`error`、`latency_ms`
-与 `cached`；`retrievals` 列出工具进程内的各个子查询、结果数量和执行 PID，顶层 `receipt` 对应整次 MCP 工具调用。
-重排未执行或失败时 `reranked=false`；同一文档在不同查询下的 score 差异不会导致重复文档。
-缓存保存 Server 返回的最终增强检索结果与完整调用回执，命中时不重复发起 MCP 调用。
+与 `cached`。`retrievals` 列出每次召回的查询、通道（`vector` 或 `bm25`）、结果数量和执行 PID，顶层 `receipt` 对应整次 MCP 工具调用。
+重排未执行或失败时 `reranked=false`，按 RRF 顺序返回。
+缓存保存 Server 返回的最终检索结果与调用回执。知识导入成功后，索引和搜索缓存都会失效。
 这些证据也随 Agent 结果存入 checkpoint，成功请求重试时直接返回原证据。
 
 工具通过真正的 MCP stdio Client/Server 执行。业务库操作真实持久化；支付退款系统和专用前端证据面板尚未接入。
@@ -438,7 +438,7 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
   -> 后端检查 Agent 可用范围与参数
   -> MCP Client 发送一次完整的 tools/call（stdin/stdout JSON-RPC）
   -> 独立 MCP Server 再检查会话凭据、调用范围和 JSON Schema
-  -> Server 完成改写、查询 ChromaDB、合并去重和重排
+  -> Server 完成改写、向量与 BM25 召回、RRF 融合和重排
   -> 完整增强检索结果及服务端回执
   -> 模型 tool_result，继续决策
 ```
@@ -903,7 +903,10 @@ curl -X POST "http://localhost:8000/search?query=退款需要多久到账&top_k=
       "title": "退款政策",
       "content": "审核通过后，款项将在 5-7 个工作日内退回原支付账户。",
       "score": 0.82,
-      "chunk": 0
+      "chunk": 0,
+      "chunk_id": "示例切片 ID",
+      "rrf_score": 0.03265,
+      "channel_ranks": {"vector": [1, 2], "bm25": 1}
     }
   ],
   "reranked": true
@@ -913,13 +916,14 @@ curl -X POST "http://localhost:8000/search?query=退款需要多久到账&top_k=
 前端演示 `/search` 和聊天模型的 `knowledge_search` 统一交给 MCP Server，在其中执行完整检索流程：
 
 ```text
-原始查询
-  -> LLM 查询改写成多个角度
-  -> 多个子查询并行召回 ChromaDB
-  -> 合并去重
-  -> LLM 重排
-  -> 返回 Top-K
+原始查询           -> BM25 关键词召回
+原始查询与改写查询 -> ChromaDB 向量召回
+两路榜单           -> 按切片 ID 做 RRF 融合 -> LLM 重排 -> 返回 Top-K
 ```
+
+BM25 索引在 MCP 进程内按需从 ChromaDB 的切片构建。RRF 按各榜名次计分，每张榜最多取 20 条，向量榜共同分摊一份权重。
+`channel_ranks.vector` 按原始查询、改写查询的顺序记录名次。`null` 表示该榜未命中。
+`score` 是向量召回分数，只有 BM25 命中时为 `null`。`rrf_score` 对应融合排序。
 
 ## 8. ChromaDB 在项目中的用途
 

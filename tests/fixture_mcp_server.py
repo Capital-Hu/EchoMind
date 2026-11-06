@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import mcp.types as types
 from mcp.server.stdio import stdio_server
+from tooling.hybrid_retrieval import BM25Index
 from tooling.mcp_server import build_server
 from tooling.knowledge_service import KnowledgeService
 from tooling.business_store import BusinessStore
@@ -22,8 +23,12 @@ class TestKnowledge:
         return len(self.documents)
 
     async def add_documents_async(self, documents):
-        self.documents.extend(documents)
+        self.documents.extend({**doc, "chunk_id": f"uploaded:{i}", "chunk": 0}
+                              for i, doc in enumerate(documents, start=len(self.documents)))
         return len(documents)
+
+    async def search_bm25_async(self, query, top_k):
+        return BM25Index(self.documents).search(query, top_k)
 
     async def search_async(self, query, top_k):
         if query == "__exit__":
@@ -33,8 +38,9 @@ class TestKnowledge:
         if query == "__error__":
             raise RuntimeError("测试后端异常")
         if query == "__env__":
-            return [{key: key in os.environ for key in ("ANTHROPIC_API_KEY", "REDIS_PASSWORD", "REDIS_URL")}]
-        return [{"title": "演示知识", "content": query}, *self.documents][:top_k]
+            return [{"chunk_id": "env", **{key: key in os.environ for key in (
+                "ANTHROPIC_API_KEY", "REDIS_PASSWORD", "REDIS_URL")}}]
+        return [{"chunk_id": f"vector:{query}", "title": "演示知识", "content": query}, *self.documents][:top_k]
 
 
 class TestModel:

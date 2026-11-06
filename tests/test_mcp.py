@@ -142,7 +142,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sentinel", "REDIS_PASSWORD": "sentinel", "REDIS_URL": "sentinel"}):
             await self.client.start()
         result = await self.call("__env__")
-        self.assertTrue(all(value is False for value in result["data"][0].values()))
+        for key in ("ANTHROPIC_API_KEY", "REDIS_PASSWORD", "REDIS_URL"):
+            self.assertIs(result["data"][0][key], False)
         await self.client.close()
 
     async def test_model_config_is_forwarded_only_when_explicitly_supplied(self):

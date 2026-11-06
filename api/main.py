@@ -347,7 +347,7 @@ async def prometheus_metrics():
 @app.post("/search")
 async def search(query: str, top_k: int = 5):
     """
-    演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
+    演示混合检索：查询改写 → 向量与 BM25 召回 → RRF 融合 → 重排。
     此接口主动调用 MCP knowledge_search；聊天里由模型选择同一工具。
     """
     if _tool_manager is None:

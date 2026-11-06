@@ -42,8 +42,7 @@ def model_response(*blocks, stop_reason=None):
 
 
 def registry(handler=None, **kwargs):
-    manager = MCPToolManager.__new__(MCPToolManager)
-    manager._tools, manager._cache = {}, {}
+    manager = MCPToolManager()
     handler = handler or AsyncMock(return_value=[{"title": "退款规则", "content": "申请后审核"}])
     manager.register(Tool("knowledge_search", "检索真实知识库", handler, copy.deepcopy(SCHEMA),
                           agent_types=("general", "technical", "billing"), **kwargs))
@@ -254,6 +253,24 @@ class RegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cached.cached)
         self.assertFalse(cached.executed)
         self.assertEqual(other.data, {"user": "b"})
+
+    async def test_successful_tool_invalidates_only_declared_caches(self):
+        manager = MCPToolManager()
+        schema = {"type": "object"}
+        read = AsyncMock(side_effect=["old price", "new price"])
+        update = AsyncMock(side_effect=[RuntimeError("update rejected"), "updated"])
+        manager.register(Tool("read_price", "读价格", read, schema, cache_ttl=60))
+        manager.register(Tool("read_stock", "读库存", AsyncMock(return_value=3), schema, cache_ttl=60))
+        manager.register(Tool("update_price", "改价格", update, schema, invalidates_cache_for=("read_price",)))
+
+        await manager.call("read_price", {})
+        await manager.call("read_stock", {})
+        self.assertFalse((await manager.call("update_price", {})).success)
+        self.assertTrue((await manager.call("read_price", {})).cached)
+
+        self.assertTrue((await manager.call("update_price", {})).success)
+        self.assertEqual((await manager.call("read_price", {})).data, "new price")
+        self.assertTrue((await manager.call("read_stock", {})).cached)
 
 
 class ToolWorkflowTests(unittest.IsolatedAsyncioTestCase):
