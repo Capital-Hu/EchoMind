@@ -41,7 +41,6 @@ class KnowledgeService:
                 self._kb = await asyncio.to_thread(
                     KnowledgeBase, chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                     chroma_port=int(os.getenv("CHROMA_PORT", "8001")),
-                    chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/chroma"),
                 )
             return self._kb
 

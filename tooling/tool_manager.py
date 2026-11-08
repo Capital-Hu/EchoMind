@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
 from tooling.mcp_client import MCPProtocolError, MCPTransportError
-from tooling.mcp_protocol import CATALOG, validate_arguments
+from tooling.mcp_protocol import BUSINESS_INSTRUCTIONS, validate_arguments
 from jsonschema import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,8 @@ class MCPToolManager:
     发现 MCP 工具并提供给模型；真实业务逻辑由服务端执行。
     """
 
-    def __init__(self):
+    def __init__(self, *, instructions=BUSINESS_INSTRUCTIONS):
+        self.instructions = instructions
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[tuple[str, str], tuple] = {}  # (工具名, 请求摘要) → (结果, 过期时间)
         self._cache_versions: Dict[str, int] = {}
@@ -141,7 +142,7 @@ class MCPToolManager:
         self.mcp_client = client
         for discovered in client.tools:
             name = discovered.name
-            policy = CATALOG[name]
+            policy = client.catalog[name]
             async def invoke(params, context, tool_name=name):
                 return await self._call_mcp(tool_name, params, context)
             self.register(Tool(name, discovered.description, invoke, discovered.inputSchema,

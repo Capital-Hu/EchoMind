@@ -20,7 +20,7 @@ from tooling.business_store import BusinessStore
 logger = logging.getLogger("echomind.mcp.server")
 
 
-def build_server(knowledge, business, token, audit_path):
+def build_server(knowledge, business, token, audit_path, *, catalog=CATALOG):
     server = Server("echomind-tools", version="1.0.0")
     audit_path = Path(audit_path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,7 +34,7 @@ def build_server(knowledge, business, token, audit_path):
     @server.list_tools()
     async def list_tools():
         return [types.Tool(name=name, description=p.description, inputSchema=p.schema)
-                for name, p in CATALOG.items()]
+                for name, p in catalog.items()]
 
     async def call_tool(request):
         name, arguments = request.params.name, request.params.arguments
@@ -44,7 +44,7 @@ def build_server(knowledge, business, token, audit_path):
         try:
             context = parse_meta(server.request_context.meta, token)
             public_context = {key: value for key, value in context.items() if key not in ("user_message", "previous_reply")}
-            policy = CATALOG.get(name)
+            policy = catalog.get(name)
             if policy is None:
                 raise ValueError("工具不存在")
             if context["agent_type"] not in policy.scopes:

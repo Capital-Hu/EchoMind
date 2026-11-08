@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>τ 零售评测 · EchoMind</title>
+<style>
+:root{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;color:#20332e;background:#f3f6f4;line-height:1.6}
+*{box-sizing:border-box}body{margin:0}header,main{max-width:1400px;margin:auto;padding:24px 32px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #dbe4df}
+h1{font-size:28px;letter-spacing:-1px;margin:0}h2{font-size:18px;margin:0 0 16px}h3{font-size:15px}p{margin:8px 0}a{color:#08694c}small,.muted{color:#65766e;font-size:13px}.brand{letter-spacing:2px;font-size:11px;font-weight:700;color:#527263}.grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:24px;align-items:start}
+.card{background:white;border:1px solid #dbe4df;border-radius:14px;padding:24px;margin-bottom:20px}.field{display:block;margin-bottom:16px;font-size:14px;font-weight:600}.field small{display:block;font-weight:400}input,select,button{font:inherit}input,select{width:100%;border:1px solid #c6d3cc;border-radius:7px;padding:9px 11px;background:white;color:inherit;margin-top:6px}select[multiple]{height:180px;padding:6px}option{padding:6px}button{border:1px solid #c6d3cc;border-radius:7px;padding:9px 16px;background:white;cursor:pointer;color:inherit}button:hover{border-color:#08694c}button:disabled{cursor:default;opacity:.5}.primary{background:#08694c;color:white;border-color:#08694c;width:100%;font-weight:600}.danger{color:#a12c24;border-color:#e6b2ac}.inline{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.inline>*{flex:1}details{margin:12px 0}summary{cursor:pointer;font-size:14px}.note{padding:12px;background:#f2f7f4;border-radius:8px;font-size:13px}.error{background:#fff0ed;border:1px solid #edc1b8;color:#8b2e24;padding:14px;border-radius:8px;margin-bottom:16px;white-space:pre-wrap} [hidden]{display:none!important}
+.run-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.badge{background:#e9f3ed;color:#176a49;padding:4px 10px;border-radius:20px;font-size:13px;white-space:nowrap}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}.metric strong{font-size:27px;display:block;line-height:1.2}.metric span{color:#65766e;font-size:12px}.metric{padding:12px;background:#f6f8f6;border-radius:9px}progress{width:100%;height:9px;accent-color:#08694c}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #e8eeea}th{color:#65766e;font-weight:500}td button{padding:3px 9px;font-size:12px}.fail{color:#ae392c}.pass{color:#087350}.empty{text-align:center;padding:50px 16px;color:#65766e}.links{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;margin-top:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f5f7f5;padding:12px;border-radius:7px;max-height:450px;overflow:auto}.message{padding:14px;margin:10px 0;background:#f5f7f5;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}.message.user{background:#edf4f0}.role{font-size:11px;font-weight:700;color:#65766e;margin-bottom:6px}.run-id{font-family:monospace;font-size:12px;overflow-wrap:anywhere}#scenario{max-height:220px;overflow:auto;font-size:12px;white-space:pre-wrap}.radio-line{display:flex;gap:14px;font-size:13px;margin:12px 0}.radio-line input{width:auto;margin-right:5px}.status-line{min-height:24px;font-size:13px;color:#527263}#detail{scroll-margin-top:20px}
+@media(max-width:800px){header,main{padding:20px 16px}.grid{grid-template-columns:1fr}.card{padding:18px}.metrics{gap:6px}.metric{padding:9px}.metric strong{font-size:23px}h1{font-size:23px}}
+</style>
+</head>
+<body>
+<header><div><div class="brand">ECHOMIND / EVALUATION</div><h1>τ 零售评测</h1><p class="muted">官方任务 · 真实对话与工具执行 · 官方判分</p></div><a href="/docs">接口文档 ↗</a></header>
+<main><div id="error" class="error" role="alert" hidden></div>
+<div class="grid"><aside><form id="form" class="card">
+<h2>新建评测</h2>
+<label class="field">题集<select id="split"><option value="train">训练集 · 74 题</option><option value="test">测试集 · 40 题</option><option value="base">全部 · 114 题</option></select><small>用训练集检查链路，用测试集报告正式成绩。</small></label>
+<div class="radio-line"><label><input type="radio" name="scope" value="selected" checked>选择题目</label><label><input type="radio" name="scope" value="all">整个题集</label></div>
+<label class="field" id="task-field">题目<select id="tasks" multiple aria-label="选择题目"></select><small>可按住 Ctrl / ⌘ 多选。默认只运行一题。</small></label>
+<details><summary>查看所选题目原文</summary><div id="scenario"></div></details>
+<label class="field">每题重复次数<input id="trials" type="number" min="1" max="10" value="1" required></label>
+<p class="note" id="system-model">正在连接评测服务…</p>
+<details><summary>模型与运行设置</summary>
+<label class="field">模拟用户模型<input id="user-model" required></label>
+<label class="field">判分模型<input id="judge-model" required></label>
+<small>使用服务端已配置的供应商凭证；系统模型由项目配置决定。</small>
+<label class="field">每题最多对话轮数<input id="max-turns" type="number" min="1" max="100" value="30" required></label>
+<label class="field">每题最长时间（秒）<input id="timeout" type="number" min="1" max="7200" value="1200" required></label>
+</details>
+<p id="estimate" class="muted"></p><button id="start" class="primary" disabled>开始评测</button>
+<p class="muted">运行会产生实际模型调用费用。每次仅运行一个实验，关闭页面不会停止。</p>
+</form><p class="muted">原版 τ²-bench retail；每题独立环境。任务失败、执行错误和中止分别记录，不自动重跑。</p></aside>
+<section>
+<div class="card"><label class="field" style="margin:0">运行记录<select id="history" aria-label="运行记录"><option value="">暂无运行</option></select></label><div id="connection" class="status-line" aria-live="polite"></div></div>
+<div class="card" id="empty"><div class="empty">选择一道训练题，点击「开始评测」。<br>进度、对话和官方结果会显示在这里。</div></div>
+<div id="run" class="card" hidden>
+<div class="run-head"><div><h2 style="margin-bottom:5px">评测进度 <span id="run-status" class="badge"></span></h2><div id="run-id" class="run-id"></div><div id="run-models" class="muted"></div></div><button id="cancel" class="danger" hidden>停止运行</button></div>
+<div class="metrics"><div class="metric"><strong id="completed">0/0</strong><span>已判分 / 计划</span></div><div class="metric"><strong id="successful">0</strong><span>任务成功</span></div><div class="metric"><strong id="failed">0</strong><span>任务失败</span></div><div class="metric"><strong id="errors">0</strong><span>执行错误</span></div></div>
+<progress id="progress" value="0" max="1"></progress><p id="progress-text" class="muted" aria-live="polite"></p><p id="run-error" class="error" hidden></p>
+<p id="pass-k" class="note"></p>
+<div class="table-wrap"><table><thead><tr><th>题目</th><th>重复</th><th>状态</th><th>官方分数</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="links" id="run-links"></div>
+</div>
+<div class="card" id="detail" hidden><h2 id="detail-title">单题详情</h2><p id="detail-status" class="muted"></p><div id="detail-links" class="links"></div><details id="judge"><summary>官方判分详情</summary><pre id="judge-json"></pre></details><div id="conversation"></div></div>
+</section></div></main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const labels={plan_only:'仅生成计划',planned:'准备中',running:'运行中',completed:'已完成',error:'执行错误',cancelled:'已停止',interrupted:'已中断',not_run:'未运行'};
+let tasks=[],currentId='',detailSlot='',runs=[],ready=false,submitting=false,stoppingId='';
+function showError(error){$('error').textContent=error.message;$('error').hidden=false;}
+async function api(path,options={}){
+ const response=await fetch('/eval/api'+path,{...options,headers:{'Content-Type':'application/json'}});
+ const data=await response.json();
+ if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail||data));
+ return data;
+}
+function selectedIds(){return [...$('tasks').selectedOptions].map(o=>o.value);}
+function updateSelection(){
+ const all=document.querySelector('input[name=scope]:checked').value==='all';
+ $('task-field').hidden=all;
+ const count=all?tasks.length:selectedIds().length;
+ $('estimate').textContent=`${count} 道题 × ${$('trials').value} 次 = ${count*Number($('trials').value)} 次任务运行`;
+ const task=tasks.find(t=>t.id===$('tasks').value);
+ $('scenario').textContent=task?task.scenario:'请选择题目';
+ $('start').disabled=!ready||submitting||!count||runs.some(r=>['running','planned'].includes(r.status));
+}
+async function loadTasks(){
+ ready=false;updateSelection();
+ tasks=await api('/tasks?split='+$('split').value);
+ $('tasks').replaceChildren(...tasks.map((task,i)=>{const o=new Option('Task '+task.id,task.id);o.selected=i===0;return o;}));
+ ready=true;updateSelection();
+}
+function links(element,base,names){element.replaceChildren(...names.map(([name,label])=>{const a=document.createElement('a');a.href='/eval/api'+base+name;a.textContent=label;a.download=name;return a;}));}
+async function selectRun(id){
+ currentId=id;detailSlot='';$('detail').hidden=true;history.replaceState(null,'','#'+id);
+ await refreshRun();
+}
+function renderRun(run){
+ const s=run.summary;$('empty').hidden=true;$('run').hidden=false;
+ $('run-status').textContent=labels[run.status];$('run-id').textContent=run.id;
+ $('run-models').textContent=`${run.config.split} · 系统 ${run.model} · 用户 ${run.config.user_model} · Judge ${run.config.judge_model}`;
+ $('cancel').hidden=!run.can_cancel;$('cancel').disabled=stoppingId===run.id;
+ $('cancel').textContent=stoppingId===run.id?'正在停止…':'停止运行';
+ $('completed').textContent=`${s.completed}/${s.planned}`;$('successful').textContent=s.successful;
+ $('failed').textContent=s.completed-s.successful;$('errors').textContent=s.errors;
+ $('progress').max=s.planned;$('progress').value=s.completed+s.errors+s.cancelled;
+ $('progress-text').textContent=`${run.active_slot?'当前题目 '+run.active_slot+'；':''}未运行 ${s.not_run}，已停止 ${s.cancelled}。`;
+ $('run-error').hidden=!run.error;$('run-error').textContent=run.error||'';
+ $('pass-k').textContent=s.pass_hat_k?Object.entries(s.pass_hat_k).map(([k,v])=>`pass^${k} = ${(v*100).toFixed(1)}%`).join(' · '):'本次计划尚未完成全部判分，暂不计算 pass^k。';
+ $('rows').replaceChildren(...run.rows.map(row=>{
+  const tr=document.createElement('tr');
+  const status=row.status==='completed'?(row.reward===1?'成功':'任务失败'):labels[row.status];
+  for(const value of [row.task_id,row.trial+1,status,row.reward??'—']){const td=document.createElement('td');td.textContent=value;tr.append(td);}
+  tr.children[2].className=row.status==='completed'?(row.reward===1?'pass':'fail'):row.status==='error'?'fail':'';
+  const td=document.createElement('td'),button=document.createElement('button');button.textContent='查看';button.disabled=row.status==='not_run';
+  button.onclick=()=>{detailSlot=row.slot;refreshDetail().then(()=>$('detail').scrollIntoView({behavior:'smooth'})).catch(showError);};td.append(button);tr.append(td);return tr;
+ }));
+ links($('run-links'),`/runs/${run.id}/files/`,[['report.md','下载报告'],['results.json','逐题结果'],['manifest.json','运行配置'],['runner.log','运行日志']]);
+}
+async function refreshDetail(){
+ if(!currentId||!detailSlot)return;
+ const id=currentId,slot=detailSlot,data=await api(`/runs/${id}/tasks/${slot}`);
+ if(id!==currentId||slot!==detailSlot)return;
+ $('detail').hidden=false;$('detail-title').textContent='题目 '+slot;
+ $('detail-status').textContent=`已完成 ${data.turns} 轮对话`+(data.result?.error?' · '+data.result.error:'');
+ links($('detail-links'),`/runs/${id}/tasks/${slot}/files/`,data.artifacts.map(n=>[n,n]));
+ $('judge').hidden=!data.result;$('judge-json').textContent=JSON.stringify(data.result,null,2);
+ $('conversation').replaceChildren(...data.trajectory.map(message=>{
+  const block=document.createElement(message.role==='tool'||message.tool_calls?'details':'div');
+  if(block.tagName==='DETAILS'){
+   const summary=document.createElement('summary');summary.textContent=message.role==='tool'?'工具返回':'调用工具：'+message.tool_calls.map(c=>c.name).join(', ');
+   const pre=document.createElement('pre');pre.textContent=JSON.stringify(message,null,2);block.append(summary,pre);
+  }else{
+   block.className='message '+message.role;const role=document.createElement('div');role.className='role';role.textContent=message.role==='user'?'模拟用户':'EchoMind';
+   block.append(role,document.createTextNode(message.content||''));
+  }return block;
+ }));
+}
+async function refreshRun(){if(!currentId)return;const id=currentId,run=await api('/runs/'+id);if(id===currentId){renderRun(run);await refreshDetail();}}
+async function refresh(){
+ runs=await api('/runs');
+ $('history').replaceChildren(...(runs.length?runs.map(run=>new Option(`${run.id} · ${labels[run.status]} · ${run.summary.completed}/${run.summary.planned}`,run.id)):[new Option('暂无运行','')]));
+ if(!currentId&&runs.length)currentId=runs[0].id;
+ $('history').value=currentId;updateSelection();await refreshRun();
+ $('connection').textContent='已连接 · 每 3 秒更新进度';
+}
+$('split').onchange=()=>loadTasks().catch(showError);
+$('tasks').onchange=updateSelection;$('trials').oninput=updateSelection;
+document.querySelectorAll('input[name=scope]').forEach(input=>input.onchange=updateSelection);
+$('history').onchange=()=>selectRun($('history').value).catch(showError);
+$('form').onsubmit=async event=>{
+ event.preventDefault();submitting=true;updateSelection();$('error').hidden=true;
+ try{
+  const run=await api('/runs',{method:'POST',body:JSON.stringify({split:$('split').value,
+   task_id:document.querySelector('input[name=scope]:checked').value==='all'?null:selectedIds(),
+   trials:Number($('trials').value),user_model:$('user-model').value.trim(),judge_model:$('judge-model').value.trim(),
+   max_turns:Number($('max-turns').value),timeout:Number($('timeout').value)})});
+  await selectRun(run.id);await refresh();
+ }catch(error){showError(error);}finally{submitting=false;updateSelection();}
+};
+$('cancel').onclick=async()=>{stoppingId=currentId;$('cancel').disabled=true;try{await api('/runs/'+currentId+'/cancel',{method:'POST'});await refresh();}catch(error){stoppingId='';$('cancel').disabled=false;showError(error);}};
+async function init(){
+ try{
+  const config=await api('/config');$('system-model').textContent='系统模型：'+config.system_model;
+  $('user-model').value=config.user_model;$('judge-model').value=config.judge_model;
+  currentId=location.hash.slice(1);await loadTasks();await refresh();
+ }catch(error){showError(error);$('connection').textContent='连接失败，无法启动评测';}
+ async function poll(){try{await refresh();}catch(error){showError(error);$('connection').textContent='更新失败，请检查评测服务';}finally{setTimeout(poll,3000);}}
+ setTimeout(poll,3000);
+}
+init();
+</script>
+</body>
+</html>

@@ -25,3 +25,6 @@ data/.DS_Store
 
 config/grafana/
 config/nginx/ssl/
+
+# Evaluation runs may include model requests and business snapshots.
+data/eval/

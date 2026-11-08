@@ -28,7 +28,8 @@ class MCPProtocolError(RuntimeError):
 
 
 class ToolMCPClient:
-    def __init__(self, *, llm_config=None, log_dir=None, startup_timeout=30, call_timeout=None, server_args=None, server_env=None):
+    def __init__(self, *, llm_config=None, log_dir=None, startup_timeout=30, call_timeout=None, server_args=None, server_env=None, catalog=CATALOG):
+        self.catalog = catalog
         self.log_dir = Path(log_dir) if log_dir else ROOT / "logs"
         self.startup_timeout, self.call_timeout = startup_timeout, call_timeout
         self.server_args = server_args or ["-m", "tooling.mcp_server"]
@@ -81,9 +82,9 @@ class ToolMCPClient:
                         initialized = await session.initialize()
                         listed = await session.list_tools()
                         found = {tool.name: tool for tool in listed.tools}
-                        if set(found) != set(CATALOG) or len(listed.tools) != len(CATALOG):
+                        if set(found) != set(self.catalog) or len(listed.tools) != len(self.catalog):
                             raise MCPProtocolError("MCP 服务工具集合与当前合同不一致")
-                        for name, policy in CATALOG.items():
+                        for name, policy in self.catalog.items():
                             if found[name].inputSchema != policy.schema or found[name].description != policy.description:
                                 raise MCPProtocolError(f"MCP 工具合同不一致: {name}")
                         self.tools = listed.tools
@@ -113,7 +114,7 @@ class ToolMCPClient:
         try:
             result = await self._session.send_request(
                 request, types.CallToolResult,
-                request_read_timeout_seconds=timedelta(seconds=self.call_timeout or CATALOG[name].timeout + 2),
+                request_read_timeout_seconds=timedelta(seconds=self.call_timeout or self.catalog[name].timeout + 2),
             )
         except Exception as ex:
             self._broken = True

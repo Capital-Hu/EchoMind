@@ -100,6 +100,8 @@ class MemoryManager:
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
         cross_conv_history: bool = True,
+        chroma_client=None,
+        key_prefix: str = "",
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -107,6 +109,7 @@ class MemoryManager:
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
         self._cross_conv_history = cross_conv_history
+        self._key_prefix = key_prefix
         # 锁覆盖同一服务进程内的写入和压缩；画像按用户串行合并。
         self._locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._profile_locks: Dict[str, asyncio.Lock] = {}
@@ -118,22 +121,16 @@ class MemoryManager:
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
 
-        # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
-        try:
-            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
+        chroma = chroma_client
+        if chroma is None:
+            # 连接失败直接抛出，不能切换存储后继续启动。
             chroma = chromadb.HttpClient(
                 host=chroma_host,
                 port=chroma_port,
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
-            chroma.heartbeat()  # 测试连接
+            chroma.heartbeat()
             logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"ChromaDB 服务不可用，使用本地嵌入式模式: {chroma_path}")
-            chroma = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
 
         # 情景记忆：存储历史对话片段
         self._episodic = chroma.get_or_create_collection("episodic")
@@ -178,7 +175,7 @@ class MemoryManager:
         """一轮消息与去重标记原子写入；checkpoint 恢复时不重复追加。"""
         user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
         identity = json.dumps([user_id, conv_id, request_id], ensure_ascii=True)
-        marker = "exchange_once:" + hashlib.sha256(identity.encode()).hexdigest()
+        marker = self._key_prefix + "exchange_once:" + hashlib.sha256(identity.encode()).hexdigest()
         timestamp = datetime.now().isoformat()
         rows = [json.dumps({"role": role.value, "content": self._safe_text(content),
                             "ts": timestamp, "metadata": {"request_id": request_id}})
@@ -484,13 +481,11 @@ class MemoryManager:
         """关闭异步 Redis 连接。"""
         await self._redis.aclose()
 
-    @staticmethod
-    def _wm_key(user_id: str, conv_id: str) -> str:
-        return f"wm:{user_id}:{conv_id}"
+    def _wm_key(self, user_id: str, conv_id: str) -> str:
+        return f"{self._key_prefix}wm:{user_id}:{conv_id}"
 
-    @staticmethod
-    def _summary_key(user_id: str, conv_id: str) -> str:
-        return f"summary:{user_id}:{conv_id}"
+    def _summary_key(self, user_id: str, conv_id: str) -> str:
+        return f"{self._key_prefix}summary:{user_id}:{conv_id}"
 
     @staticmethod
     def _safe_text(value: Any) -> str:

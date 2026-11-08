@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from core.llm_utils import get_max_tokens
 from agents.chat_workflow import ChatWorkflow, WorkflowConflict, WorkflowExecutionError
 from tooling.mcp_protocol import CATALOG, validate_arguments
+from api.evaluation import router as evaluation_router
 
 load_dotenv()
 
@@ -52,7 +53,6 @@ _orchestrator = None
 _memory       = None
 _tool_manager = None
 _monitor      = None
-_evaluator    = None
 _skill_manager = None
 _workflow = None
 
@@ -109,13 +109,11 @@ async def _admin_tool_call(name, params):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _workflow
+    global _orchestrator, _memory, _tool_manager, _monitor, _skill_manager, _workflow
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator
-    from core.intent_recognizer import IntentRecognizer
-    from evaluation.evaluator import EndToEndEvaluator
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -123,13 +121,6 @@ async def lifespan(app: FastAPI):
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
     logger.info(f"模型统一输出上限: {get_max_tokens()} tokens")
-
-    # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
-    recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
     skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
@@ -177,16 +168,6 @@ async def lifespan(app: FastAPI):
         resources.push_async_callback(_monitor.stop)
         await _monitor.start()
 
-        # 评测器
-        _evaluator = EndToEndEvaluator(
-            orchestrator=_orchestrator,
-            recognizer=recognizer,
-            api_key=cfg["api_key"],
-            base_url=cfg.get("base_url"),
-            model=cfg["model"],
-            baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-        )
-
         _workflow = ChatWorkflow(_memory, _orchestrator)
         resources.push_async_callback(_workflow.close)
         await _workflow.start()
@@ -203,7 +184,9 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
+    description="[打开 τ 零售评测页面](/eval)",
 )
+app.include_router(evaluation_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -376,27 +359,6 @@ class BatchDocInput(BaseModel):
     documents: List[DocInput]
 
 
-class EvalIntentInput(BaseModel):
-    """意图识别评测用例。"""
-    message: str
-    expected_intent: str
-    context: Optional[Dict[str, Any]] = None
-
-
-class EvalDialogInput(BaseModel):
-    """对话质量评测用例。question 单轮，turns 多轮。"""
-    question: Optional[str] = None
-    turns: Optional[List[str]] = None
-    user_id: Optional[str] = None
-    conv_id: Optional[str] = None
-
-
-class EvalRunInput(BaseModel):
-    """评测请求。为空时使用内置默认用例。"""
-    intent_cases: Optional[List[EvalIntentInput]] = None
-    dialog_cases: Optional[List[EvalDialogInput]] = None
-
-
 @app.post("/knowledge/add", tags=["知识库"])
 async def add_knowledge(body: BatchDocInput):
     """
@@ -473,57 +435,6 @@ async def mcp_status():
     if _tool_manager is None:
         raise HTTPException(503, "工具服务未初始化")
     return await _tool_manager.mcp_client.check_status()
-
-
-@app.post("/eval/run")
-async def run_eval(body: Optional[EvalRunInput] = None):
-    """运行内置评测用例，返回评测报告。"""
-    if _evaluator is None:
-        raise HTTPException(503, "服务未就绪")
-    from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase
-
-    if body and body.intent_cases is not None:
-        intent_cases = [
-            IntentTestCase(
-                message=c.message,
-                expected_intent=c.expected_intent,
-                context=c.context,
-            )
-            for c in body.intent_cases
-        ]
-    else:
-        intent_cases = DEFAULT_INTENT_CASES
-
-    if body and body.dialog_cases is not None:
-        dialog_cases = [
-            c.model_dump(exclude_none=True)
-            for c in body.dialog_cases
-        ]
-    else:
-        dialog_cases = DEFAULT_DIALOG_CASES
-
-    report = await _evaluator.run(
-        intent_cases=intent_cases,
-        dialog_cases=dialog_cases,
-    )
-    return {
-        "pass_rate":       report.pass_rate,
-        "total":           report.total,
-        "passed":          report.passed,
-        "avg_scores":      report.avg_scores,
-        "regressions":     report.regressions,
-        "recommendations": report.recommendations,
-        "results": [
-            {
-                "test_id": r.test_id,
-                "passed": r.passed,
-                "scores": r.scores,
-                "detail": r.detail,
-                "metadata": r.metadata,
-            }
-            for r in report.results
-        ],
-    }
 
 
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────

@@ -74,3 +74,22 @@ RUN mkdir -p /app/data/chroma /app/data/workflow /app/data/business /app/logs /a
 EXPOSE 8000
 
 CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+# τ 的代码、数据、用户模拟器和评分器来自同一个固定官方版本。
+FROM dependencies AS tau-dependencies
+ARG TAU_REVISION=fc0055dc4e0a316c3f83133267fbd6faaa770992
+RUN mkdir /opt/tau2 && \
+    curl --fail -L "https://github.com/sierra-research/tau2-bench/archive/${TAU_REVISION}.tar.gz" \
+        -o /tmp/tau2.tar.gz && \
+    tar -xzf /tmp/tau2.tar.gz --strip-components=1 -C /opt/tau2 && \
+    pip install /opt/tau2 && \
+    pip check && rm /tmp/tau2.tar.gz
+FROM tau-dependencies AS evaluation
+ENV TAU2_DATA_DIR=/opt/tau2/data
+RUN useradd -m -u 1000 echomind
+COPY --from=model-assets --chown=echomind:echomind /root/.cache/chroma /home/echomind/.cache/chroma
+COPY --chown=echomind:echomind . .
+RUN mkdir -p /app/data/eval && chown -R echomind:echomind /app/data/eval
+USER echomind
+ENTRYPOINT ["python", "-m", "evaluation.run"]
+CMD ["--help"]

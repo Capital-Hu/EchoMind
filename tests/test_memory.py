@@ -109,6 +109,7 @@ def response(text):
 
 def make_manager(cross_conv=True):
     manager = MemoryManager.__new__(MemoryManager)
+    manager._key_prefix = ""
     manager._redis = FakeRedis()
     manager._episodic = FakeCollection()
     manager._profile = FakeCollection()

@@ -19,7 +19,7 @@ EchoMind 是一个企业级智能客服系统，核心链路为：
 
 ```text
 EchoMind/
-├── api/main.py                    # FastAPI 入口，/chat /search /knowledge /monitor /eval
+├── api/main.py                    # FastAPI 入口，/chat /search /knowledge /monitor
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
 ├── agents/chat_workflow.py        # LangGraph 节点、持久化与中断恢复
@@ -36,7 +36,7 @@ EchoMind/
 ├── tooling/mcp_protocol.py        # 工具 Schema、调用范围与上下文合同
 ├── tooling/knowledge_base.py      # ChromaDB RAG 知识库
 ├── monitor/performance_monitor.py # Agent/工具在线监控
-├── evaluation/evaluator.py        # 端到端评测
+├── evaluation/run.py              # τ 官方零售评测
 ├── data/demo_docs/                # 演示知识库文档
 ├── docker-compose.yml             # Docker 全栈编排
 ├── Dockerfile
@@ -80,7 +80,7 @@ ANTHROPIC_API_KEY=your_deepseek_key
 CLAUDE_MAX_TOKENS=4096
 ```
 
-意图识别、查询改写、检索重排、用户画像、摘要生成与合并、Agent 回复和评测均使用
+意图识别、查询改写、检索重排、用户画像、摘要生成与合并、Agent 回复均使用
 这个值，问题处理记录的提取也共用此配置。它只控制输出额度，思考模式仍沿用当前
 模型设置；摘要最终仍限制在 800 字内。
 
@@ -248,7 +248,7 @@ http://localhost/docs
 6. GET /monitor               查看 Agent 和工具运行指标
 7. GET /skills                查看已加载 Skills
 8. POST /skills/reload        重新加载 Skills
-9. POST /eval/run             运行端到端评测
+9. τ retail                  独立运行官方零售评测
 ```
 
 ### 5.1 接口总览
@@ -267,7 +267,6 @@ http://localhost/docs
 | `POST` | `/knowledge/upload` | Form File | 上传 `.txt`、`.md`、`.json` 文件导入知识库 | 手动上传知识库文件 |
 | `GET` | `/knowledge/stats` | 无 | 查看知识库文档片段总数 | 确认知识库是否有数据 |
 | `GET` | `/business/stats` | 无 | 通过 MCP 查看业务 SQLite 路径、来源与表数量 | 核对业务库和持久化结果 |
-| `POST` | `/eval/run` | 无 | 运行内置意图识别和端到端对话评测 | 演示 LLM-as-Judge 评测 |
 | `GET` | `/docs` | 浏览器访问 | Swagger UI | 浏览和调试所有接口 |
 
 ### 5.2 Skills 动态能力加载
@@ -696,25 +695,19 @@ curl http://localhost:8000/monitor
 | `active_alerts` | 最近告警 |
 | `suggestions` | 优化建议 |
 
-### 5.10 `/eval/run`
+### 5.10 τ 零售评测
 
-用途：运行内置评测。
+打开 [评测页面](http://localhost:8000/eval)，选择题集、题目和重复次数，点击「开始评测」。
+支持进度查看、停止、刷新后找回运行，以及逐题对话、官方分数和结果下载。
+启动 `docker compose up -d --build echomind` 会自动带起评测服务及 Redis、ChromaDB。
+
+评测直接采用固定版本 τ²-bench 的零售任务、模拟用户、工具环境与官方评分器。
+EchoMind 通过真实 HTTP、工作流、记忆和 MCP 处理任务，详见 [评测说明](evaluation/README.md)。
 
 ```bash
-curl -X POST http://localhost:8000/eval/run
+docker compose build evaluation
+docker compose run --rm evaluation --split test --plan-only
 ```
-
-返回内容包括：
-
-| 字段 | 说明 |
-|------|------|
-| `pass_rate` | 评测通过率 |
-| `total` | 评测项总数 |
-| `passed` | 通过项数量 |
-| `avg_scores` | 平均评分 |
-| `regressions` | 回归检测结果 |
-| `recommendations` | 优化建议 |
-| `results` | 每条评测结果 |
 
 ## 6. 使用项目
 
@@ -1546,41 +1539,22 @@ Prometheus 页面：
 http://localhost:9090
 ```
 
-## 13. 运行端到端评测
+## 13. 运行 τ 零售评测
+
+页面入口：[http://localhost:8000/eval](http://localhost:8000/eval)。
+默认跑一道训练题；正式评测选择「测试集」和「整个题集」。
+
+详见 [运行方法、官方判分与产物说明](evaluation/README.md)。
 
 ```bash
-curl -X POST http://localhost:8000/eval/run
+docker compose build evaluation
+docker compose run --rm evaluation --split train --task-id 0 \
+  --user-model deepseek/deepseek-flash --judge-model deepseek/deepseek-flash
 ```
 
-评测内容：
-
-1. 意图识别准确率和 Macro-F1
-2. 调用 Orchestrator 生成真实回复
-3. LLM-as-Judge 从相关性、准确性、完整性、有用性打分
-4. 与上一次评测结果做回归检测
-5. 生成优化建议
-
-响应示例：
-
-```json
-{
-  "pass_rate": 0.83,
-  "total": 5,
-  "passed": 4,
-  "avg_scores": {
-    "intent_accuracy": 0.875,
-    "relevance": 0.88,
-    "accuracy": 0.82,
-    "completeness": 0.79,
-    "helpfulness": 0.85
-  },
-  "regressions": [],
-  "recommendations": [
-    "意图识别准确率 < 90%：增加 Few-shot 示例，或对低 F1 的意图类别补充训练数据"
-  ],
-  "results": []
-}
-```
+用户模型和 Judge 需要对应供应商凭证。正式评测使用 `--split test --trials 3`。
+官方评分器比较实际工具执行后的数据库状态与任务目标，并检查任务指定的自然语言要求。
+结果保存在 `data/eval/tau/<run-id>/`，同时记录失败、执行错误和未运行任务。
 
 ## 14. 停止、重启和清理
 
@@ -1739,5 +1713,5 @@ curl http://localhost:8000/monitor
 curl http://localhost:8000/skills
 
 # 9. 评测
-curl -X POST http://localhost:8000/eval/run
+docker compose run --rm evaluation --split test --plan-only
 ```

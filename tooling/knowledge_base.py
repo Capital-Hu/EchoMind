@@ -39,29 +39,16 @@ class KnowledgeBase:
         self,
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
-        chroma_path: str = "./data/chroma",
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
-        self._use_server = False
-        try:
-            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
-            self._client = chromadb.HttpClient(
-                host=chroma_host,
-                port=chroma_port,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-            self._client.heartbeat()
-            self._use_server = True
-            logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
-            self._client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+        self._client = chromadb.HttpClient(
+            host=chroma_host,
+            port=chroma_port,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
+        self._client.heartbeat()
+        logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 使用 Chroma 默认 embedding function，客户端需要默认模型缓存。
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
