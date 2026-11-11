@@ -20,6 +20,8 @@ EchoMind 是一个企业级智能客服系统，核心链路为：
 ```text
 EchoMind/
 ├── api/main.py                    # FastAPI 入口，/chat /search /knowledge /monitor
+├── api/evaluation.py              # /eval 页面与评测服务代理
+├── api/evaluation.html            # τ 评测页面
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
 ├── agents/chat_workflow.py        # LangGraph 节点、持久化与中断恢复
@@ -35,9 +37,11 @@ EchoMind/
 ├── tooling/mcp_server.py          # 独立 MCP 工具进程
 ├── tooling/mcp_protocol.py        # 工具 Schema、调用范围与上下文合同
 ├── tooling/knowledge_base.py      # ChromaDB RAG 知识库
+├── tooling/hybrid_retrieval.py    # BM25 关键词召回与 RRF 融合
 ├── monitor/performance_monitor.py # Agent/工具在线监控
 ├── evaluation/run.py              # τ 官方零售评测
-├── data/demo_docs/                # 演示知识库文档
+├── evaluation/web.py              # 独立 τ 评测服务
+├── fixtures/knowledge/            # 可直接上传的演示知识库文档
 ├── docker-compose.yml             # Docker 全栈编排
 ├── Dockerfile
 ├── requirements.txt
@@ -60,7 +64,7 @@ EchoMind/
 cp .env.example .env
 ```
 
-最少需要配置：
+主应用使用官方 Anthropic 接口时，最少需要配置：
 
 ```env
 ANTHROPIC_API_KEY=your_api_key
@@ -74,7 +78,13 @@ ANTHROPIC_MODEL=deepseek-v4-pro
 ANTHROPIC_API_KEY=your_deepseek_key
 ```
 
-所有模型调用的输出上限统一在 `.env` 配置，默认 4096，必须是正整数：
+主应用未配置 `ANTHROPIC_MODEL` 时使用代码中的默认模型；使用其他模型时请显式填写账号可用的模型名称。
+**评测页面还必须设置 `ANTHROPIC_MODEL`**：当前 `evaluation/web.py` 直接读取这个变量，
+并将用户模拟器和 Judge 的默认模型设为 `deepseek/<ANTHROPIC_MODEL>`，启动时将
+`ANTHROPIC_API_KEY` 复制为 `DEEPSEEK_API_KEY`，因此页面默认流程要求使用 DeepSeek 凭证。
+其他供应商的配置方式见 [评测说明](evaluation/README.md)。独立评测 CLI 不自动复制凭证。
+
+EchoMind 主应用模型调用的输出上限统一在 `.env` 配置，默认 4096，必须是正整数：
 
 ```env
 CLAUDE_MAX_TOKENS=4096
@@ -83,6 +93,7 @@ CLAUDE_MAX_TOKENS=4096
 意图识别、查询改写、检索重排、用户画像、摘要生成与合并、Agent 回复均使用
 这个值，问题处理记录的提取也共用此配置。它只控制输出额度，思考模式仍沿用当前
 模型设置；摘要最终仍限制在 800 字内。
+τ 用户模拟器和 Judge 使用独立的输出上限，默认 8192，可在评测页面或 CLI 的 `--max-tokens` 中设置。
 
 修改 `.env` 后，本地运行需重新启动后端进程。Docker Compose 需重新创建应用容器
 以加载新环境变量，仅执行 `docker compose restart` 不会重新读取 `.env`：
@@ -91,10 +102,18 @@ CLAUDE_MAX_TOKENS=4096
 docker compose up -d --no-deps --force-recreate echomind
 ```
 
-Docker Compose 场景下，Redis 和 ChromaDB 的连接由 `docker-compose.yml` 覆盖为容器内地址。通常不需要手动改：
+如果评测服务也要使用更新后的模型或凭证，需要在没有运行中实验时同时重建 `tau-eval` 容器：
+
+```bash
+docker compose up -d --no-deps --force-recreate tau-eval echomind
+```
+
+Docker Compose 场景下，Redis 和 ChromaDB 的连接由 `docker-compose.yml` 覆盖为容器内地址。
+Redis 密码取自 `.env` 的 `REDIS_PASSWORD`；示例文件中的值为 `echomind123`。
+以下是示例文件的相关配置：
 
 ```env
-REDIS_PASSWORD=your_redis_password
+REDIS_PASSWORD=echomind123
 CHROMA_HOST=localhost
 CHROMA_PORT=8001
 ```
@@ -105,12 +124,12 @@ EchoMind 常用两种 Docker 启动方式：`docker compose up` 全栈部署，�
 
 | 对比项 | Docker Compose 全栈部署 | Docker run 开发模式 |
 |--------|--------------------------|----------------------|
-| 启动命令 | `docker compose up -d --build` | `docker run ... echomind ...` |
-| 启动内容 | EchoMind、Redis、ChromaDB、Prometheus、Nginx | 只启动你指定的单个容器 |
+| 启动命令 | `docker compose up -d --build` | `docker run ... echomind-dev ...` |
+| 启动内容 | EchoMind、tau-eval、Redis、ChromaDB、Prometheus、Nginx | 只启动你指定的单个容器 |
 | Redis/ChromaDB | 自动启动并加入同一网络 | 必须先执行 `docker compose up -d redis chromadb` |
 | 容器网络 | Compose 自动创建并管理 | 需要手动指定 `--network echomind_echomind-network` |
 | 服务名解析 | 应用可直接访问 `redis`、`chromadb` | 只有加入同一网络后才可访问 `redis`、`chromadb` |
-| 代码更新 | 通常需要 rebuild 或重启服务 | 挂载 `-v "$(pwd):/workspace"` 后，代码修改可直接生效，重启容器即可 |
+| 代码更新 | 通常需要 rebuild 或重启服务 | 按第 4 节挂载源码并使用 development 镜像，HTTP 服务自动重载；CLI 需重新运行 |
 | 适合场景 | 演示、联调、完整部署、HTTP API 服务 | 本地开发、调试 CLI、临时覆盖环境变量 |
 | 常见问题 | API Key 或依赖健康检查失败 | 忘记启动 Redis/ChromaDB，导致 `redis:6379 Name or service not known` |
 
@@ -147,10 +166,14 @@ docker compose logs -f echomind
 | 服务 | 容器名 | 宿主机端口 | 容器内端口 | 用途 |
 |------|--------|------------|------------|------|
 | EchoMind API | `echomind-app` | `8000` | `8000` | 主 API 服务 |
+| τ 评测服务 | Compose 自动命名（服务名 `tau-eval`） | 不开放 | `8002` | 主应用通过 `/eval/api/*` 代理访问 |
 | Nginx | `echomind-nginx` | `80` | `80` | 反向代理 |
 | ChromaDB | `echomind-chromadb` | `8001` | `8000` | 向量数据库 |
 | Redis | `echomind-redis` | `6379` | `6379` | 工作记忆 |
 | Prometheus | `echomind-prometheus` | `9090` | `9090` | 监控数据 |
+
+`tau-eval` 是主应用的启动依赖，全栈启动会构建包含官方 τ²-bench 的评测镜像。
+`evaluation` 是按需运行的 CLI 服务，位于 `eval` profile，不会作为常驻服务随全栈启动。
 
 健康检查：
 
@@ -180,11 +203,15 @@ curl http://localhost/health
 docker compose up -d redis chromadb
 ```
 
-构建镜像：
+构建并显式命名开发镜像（Compose 构建不会自动生成名为 `echomind` 的镜像）：
 
 ```bash
-docker compose build --no-cache echomind
+docker build --target development -t echomind-dev .
 ```
+
+以下命令在项目根目录执行，使用 `.env` 中的模型配置。Redis URL 中的 `echomind123`
+对应示例密码；如已修改 `REDIS_PASSWORD`，请同步替换 URL 中的密码（特殊字符需 URL 编码）。
+网络名按默认 Compose 项目名 `echomind` 编写；若指定了其他项目名，请相应替换。
 
 启动 HTTP 服务：
 
@@ -192,16 +219,15 @@ docker compose build --no-cache echomind
 docker run -it --rm \
   --network echomind_echomind-network \
   -p 8000:8000 \
-  -e ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic" \
-  -e ANTHROPIC_API_KEY="your_key" \
-  -e ANTHROPIC_MODEL="deepseek-v4-pro" \
-  -e REDIS_URL="redis://:your_redis_password@redis:6379/0" \
+  --env-file .env \
+  -e PYTHONPATH=/workspace \
+  -e REDIS_URL="redis://:echomind123@redis:6379/0" \
   -e CHROMA_HOST="chromadb" \
   -e CHROMA_PORT="8000" \
   -e CHROMA_PERSIST_DIRECTORY="/workspace/data/chroma" \
   -v "$(pwd):/workspace" \
   -w /workspace \
-  echomind
+  echomind-dev
 ```
 
 CLI 交互模式：
@@ -209,21 +235,26 @@ CLI 交互模式：
 ```bash
 docker run -it --rm \
   --network echomind_echomind-network \
-  -e ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic" \
-  -e ANTHROPIC_API_KEY="your_key" \
-  -e ANTHROPIC_MODEL="deepseek-v4-pro" \
-  -e REDIS_URL="redis://:your_redis_password@redis:6379/0" \
+  --env-file .env \
+  -e PYTHONPATH=/workspace \
+  -e REDIS_URL="redis://:echomind123@redis:6379/0" \
   -e CHROMA_HOST="chromadb" \
   -e CHROMA_PORT="8000" \
+  -e CHROMA_PERSIST_DIRECTORY="/workspace/data/chroma" \
   -v "$(pwd):/workspace" \
   -w /workspace \
-  echomind \
+  echomind-dev \
   python api/main.py --cli
 ```
+
+以上开发命令提供聊天、知识库和 CLI 功能。要使用评测页面，还需运行
+`docker compose up -d --build tau-eval`，并在 HTTP 容器的启动参数中加入
+`-e TAU_SERVICE_URL=http://tau-eval:8002`。
 
 ## 5. Swagger 和接口总览
 
 EchoMind 基于 FastAPI 构建，启动 HTTP 服务后可以直接在浏览器访问 Swagger UI 调用接口。
+当前仓库提供 Swagger 和 `/eval` 评测页面；聊天通过 HTTP API 或 CLI 使用，未包含独立聊天前端。
 
 本地 Swagger 地址：
 
@@ -267,6 +298,11 @@ http://localhost/docs
 | `POST` | `/knowledge/upload` | Form File | 上传 `.txt`、`.md`、`.json` 文件导入知识库 | 手动上传知识库文件 |
 | `GET` | `/knowledge/stats` | 无 | 查看知识库文档片段总数 | 确认知识库是否有数据 |
 | `GET` | `/business/stats` | 无 | 通过 MCP 查看业务 SQLite 路径、来源与表数量 | 核对业务库和持久化结果 |
+| `GET` | `/mcp/status` | 无 | 查看 MCP 子进程连接状态 | 排查工具服务连接 |
+| `GET` | `/memory/problems` | Query：`user_id`、`conv_id` | 查看会话问题处理记录 | 核对当前及历史问题 |
+| `GET` | `/metrics` | 无 | Prometheus 格式指标 | 指标采集 |
+| `GET` | `/eval` | 浏览器访问 | τ 零售评测页面（不列入 Swagger） | 启动、查看和停止评测 |
+| `GET` / `POST` | `/eval/api/{path}` | 随具体路径而定 | 转发到 `tau-eval`，如 `GET /eval/api/config`、`GET /eval/api/runs` | 评测配置、任务、结果与下载 |
 | `GET` | `/docs` | 浏览器访问 | Swagger UI | 浏览和调试所有接口 |
 
 ### 5.2 Skills 动态能力加载
@@ -388,7 +424,7 @@ API 与 CLI 的 Agent 使用 Anthropic Messages 原生 `tools` 参数，模型�
 
 当前提供知识检索和 SQLite 业务工具，模型可查询当前用户订单、准备并提交退货、查询进度和记录交接。聊天不再按关键词提前检索：
 模型自行决定是否检索、搜索什么、取多少条，以及是否调整查询再次检索。
-前端演示 `/search` 和模型的 `knowledge_search` 都把完整请求交给同一个 MCP Server，
+检索演示接口 `/search` 和模型的 `knowledge_search` 都把完整请求交给同一个 MCP Server，
 由工具子进程内唯一的 `KnowledgeService` 实例完成改写、召回、去重与重排，再一次性返回结果。
 主程序只转发调用，不创建检索实例。现有对话记忆、问题记录和 Skills 继续提供背景。
 
@@ -462,7 +498,7 @@ Server 通过显式白名单接收现有模型配置（API Key、模型名、Bas
 用于自己发起改写和重排的模型请求；不继承 Redis 配置。这是后端与工具进程的范围检查，现有 HTTP 接口尚未提供账户登录鉴权。
 
 三个 MCP 知识工具由子进程执行，`/knowledge/add`、`/knowledge/upload`、`/knowledge/stats` 也通过 MCP。
-前端演示 `/search` 同样调用 MCP 的 `knowledge_search`，使用与聊天工具相同的服务实例和知识库连接。
+检索演示接口 `/search` 同样调用 MCP 的 `knowledge_search`，使用与聊天工具相同的服务实例和知识库连接。
 主进程的工具管理器只负责定义、范围检查、缓存和转发，不代 Server 做改写或重排。
 `mcp_server.py` 负责 MCP 协议、权限检查、超时和调用日志；`knowledge_service.py` 负责具体的知识库业务流程，
 由 Server 调用，不是另一个独立服务。演示每次都执行真实 MCP 调用，聊天工具仍可复用缓存结果。
@@ -495,9 +531,9 @@ Server 通过显式白名单接收现有模型配置（API Key、模型名、Bas
 
 演示账号与订单：
 
-| API / 前端 user_id | 订单 | 首次初始化状态 |
+| API user_id | 订单 | 首次初始化状态 |
 |---|---|---|
-| `u1001`（前端默认） | `ORD-DEMO-1001` | 已签收，耳机 1 件，实付 199.00 元 |
+| `u1001`（退货示例账号） | `ORD-DEMO-1001` | 已签收，耳机 1 件，实付 199.00 元 |
 | `u1001` | `ORD-DEMO-1002` | 已签收，保温杯 2 件，每件实付 79.00 元；帆布包 1 件 |
 | `u1001` | `ORD-DEMO-1003` | 已发货未签收，用于验证拒绝自助退货 |
 | `u1001` | `ORD-DEMO-1004` | 已超过自助期限，用于验证交接处理 |
@@ -590,7 +626,7 @@ curl -X POST http://localhost:8000/chat \
 
 成功响应新增 `workflow` 字段，包含 `request_id`、`checkpoint_id`、`node_path`、
 `resumed`（本次是否恢复）、`cached`（是否直接返回已有结果）。已成功的请求重试直接返回原结果。
-前端已经会为 Python 聊天请求发送此编号，并在请求失败后的同页重试中沿用。
+调用方需为每条新消息生成此编号，并在重试同一条消息时沿用。
 如果首条消息未带 `conv_id`，相同用户与请求编号仍会对应同一会话，以便第一次请求失败后恢复。
 
 查询保存到哪一步：
@@ -667,7 +703,7 @@ curl -X POST "http://localhost:8000/search?query=退款多久到账&top_k=3"
 
 ```bash
 curl -X POST http://localhost:8000/knowledge/upload \
-  -F "file=@data/demo_docs/sample_knowledge.json"
+  -F "file=@fixtures/knowledge/sample_knowledge.json"
 ```
 
 ### 5.8 `/knowledge/stats`
@@ -859,14 +895,14 @@ curl -X POST http://localhost:8000/knowledge/add \
 
 ```bash
 curl -X POST http://localhost:8000/knowledge/upload \
-  -F "file=@data/demo_docs/troubleshooting.md"
+  -F "file=@fixtures/knowledge/troubleshooting.md"
 ```
 
 上传 JSON：
 
 ```bash
 curl -X POST http://localhost:8000/knowledge/upload \
-  -F "file=@data/demo_docs/sample_knowledge.json"
+  -F "file=@fixtures/knowledge/sample_knowledge.json"
 ```
 
 JSON 格式必须是数组：
@@ -906,7 +942,7 @@ curl -X POST "http://localhost:8000/search?query=退款需要多久到账&top_k=
 }
 ```
 
-前端演示 `/search` 和聊天模型的 `knowledge_search` 统一交给 MCP Server，在其中执行完整检索流程：
+检索演示接口 `/search` 和聊天模型的 `knowledge_search` 统一交给 MCP Server，在其中执行完整检索流程：
 
 ```text
 原始查询           -> BM25 关键词召回
@@ -1205,10 +1241,10 @@ Redis 容器名：
 echomind-redis
 ```
 
-进入 Redis：
+进入 Redis（按提示输入 `.env` 中实际的 `REDIS_PASSWORD`）：
 
 ```bash
-docker exec -it echomind-redis redis-cli -a your_redis_password
+docker exec -it echomind-redis redis-cli --askpass
 ```
 
 查看 key：
@@ -1265,14 +1301,13 @@ API 和 CLI 在每次回答前，会读取当前问题记录，并用本轮用�
 
 如果模型输出截断、JSON 格式错误或保存失败，原记录保留，聊天仍继续，响应的
 `problem_record_error` 会说明本轮记录未更新。`problem_record` 返回本轮对应记录，
-前端的“运行详情”中可直接查看。“客服建议与上次回复”保留实际回复；其中的结构化
-历史建议会在下一轮提取。
+可在 Swagger 或 HTTP 响应中查看。记录保留实际客服回复，结构化历史建议会在下一轮提取。
 
-聊天响应中的 `tool_traces` 是前端展示执行证据的数据源，Python 前端不再另查追踪接口。
-每条回复和“运行详情”共用同一展示组件，可展开实际参数、完整返回结果、错误、执行
-Agent、MCP 调用编号、进程 PID 和执行时间。业务工具还展示 SQLite 路径、操作编号、
-读写类型和业务变更行数（不包含调用日志）；重复提交返回已有记录时显示未重复写入。
-缓存、拒绝执行、执行失败和结果未确认分别展示。
+聊天响应中的 `tool_traces` 提供执行证据，可在 Swagger 或 HTTP 响应中查看实际参数、
+返回结果、错误、执行 Agent、MCP 调用编号、进程 PID 和耗时。业务工具结果还包含
+SQLite 路径、操作编号、读写类型和业务变更行数（不包含操作日志）。
+通过 `cached`、`executed`、`success`、`execution_status` 和 `error` 区分缓存命中、
+拒绝执行、执行失败及结果未确认；重复退货提交可检查 `replayed` 和 `rows_changed`。
 
 问题记录中的 `facts` 继续只保存带用户原话的描述，`verified_facts` 单独保存成功 MCP
 调用的参数、原始数据和回执。它由后端根据真实调用结果直接写入，不由模型生成，
@@ -1348,10 +1383,10 @@ conv_id = 5a076f2b-b607-4339-9e9f-f0399862d366
 
 ### 11.1 查看 Redis 中的会话摘要
 
-进入 Redis：
+进入 Redis（按提示输入 `.env` 中实际的 `REDIS_PASSWORD`）：
 
 ```bash
-docker exec -it echomind-redis redis-cli -a your_redis_password
+docker exec -it echomind-redis redis-cli --askpass
 ```
 
 查询摘要：
@@ -1363,7 +1398,7 @@ GET summary:cli_user:5a076f2b-b607-4339-9e9f-f0399862d366
 一条命令快速查看：
 
 ```bash
-docker exec -it echomind-redis redis-cli -a your_redis_password \
+docker exec -it echomind-redis redis-cli --askpass \
   GET summary:cli_user:5a076f2b-b607-4339-9e9f-f0399862d366
 ```
 
@@ -1378,7 +1413,7 @@ LRANGE wm:cli_user:5a076f2b-b607-4339-9e9f-f0399862d366 0 -1
 一条命令快速查看：
 
 ```bash
-docker exec -it echomind-redis redis-cli -a your_redis_password \
+docker exec -it echomind-redis redis-cli --askpass \
   LRANGE wm:cli_user:5a076f2b-b607-4339-9e9f-f0399862d366 0 -1
 ```
 
@@ -1546,6 +1581,9 @@ http://localhost:9090
 
 详见 [运行方法、官方判分与产物说明](evaluation/README.md)。
 
+以下 CLI 示例要求在 `.env` 中另外设置 `DEEPSEEK_API_KEY`，并使用账号可用的
+用户/Judge 模型。CLI 不会像页面服务一样自动复用 `ANTHROPIC_API_KEY`。
+
 ```bash
 docker compose build evaluation
 docker compose run --rm evaluation --split train --task-id 0 \
@@ -1628,16 +1666,14 @@ PY
 
 ### 15.3 Redis 认证失败
 
-确认 `.env` 和 `docker-compose.yml` 中使用的密码一致。默认密码是：
-
-```text
-your_redis_password
-```
+确认 Redis 服务与应用连接使用相同的密码。复制 `.env.example` 后，示例密码为
+`echomind123`；只有未设置或留空 `REDIS_PASSWORD` 时，Compose 才使用回退值
+`your_redis_password`。请以实际配置为准，以下命令会提示输入密码。
 
 测试连接：
 
 ```bash
-docker exec -it echomind-redis redis-cli -a your_redis_password ping
+docker exec -it echomind-redis redis-cli --askpass ping
 ```
 
 ### 15.4 `/search` 没有结果
@@ -1652,7 +1688,7 @@ curl http://localhost:8000/knowledge/stats
 
 ```bash
 curl -X POST http://localhost:8000/knowledge/upload \
-  -F "file=@data/demo_docs/sample_knowledge.json"
+  -F "file=@fixtures/knowledge/sample_knowledge.json"
 ```
 
 再测试：
@@ -1668,7 +1704,7 @@ curl -X POST "http://localhost:8000/search?query=API如何接入&top_k=3"
 1. 先调用 `/chat`，使用固定 `user_id`
 2. 等待几秒
 3. 查看 `docker compose logs -f echomind` 是否出现 `用户画像已更新`
-4. 使用第 8.6 节的 Python 脚本查询 `user_profile`
+4. 使用第 9.6 节的 Python 脚本查询 `user_profile`
 
 ### 15.6 情景记忆查不到
 
@@ -1701,7 +1737,7 @@ curl http://localhost:8000/knowledge/stats
 
 # 5. 导入演示知识库
 curl -X POST http://localhost:8000/knowledge/upload \
-  -F "file=@data/demo_docs/sample_knowledge.json"
+  -F "file=@fixtures/knowledge/sample_knowledge.json"
 
 # 6. 检索
 curl -X POST "http://localhost:8000/search?query=EchoMind如何接入API&top_k=3"
@@ -1712,6 +1748,6 @@ curl http://localhost:8000/monitor
 # 8. Skills
 curl http://localhost:8000/skills
 
-# 9. 评测
+# 9. 生成评测计划（不调用模型、不产生实际成绩）
 docker compose run --rm evaluation --split test --plan-only
 ```

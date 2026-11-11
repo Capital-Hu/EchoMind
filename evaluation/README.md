@@ -26,10 +26,23 @@ docker compose up -d --build echomind
 `tau-eval` 和 CLI 使用相同镜像、`prepare/run`、官方数据和评分器，没有另一套页面评测逻辑。
 评测服务不直接开放宿主机端口。
 
-当前 Compose 配置针对项目正在使用的 DeepSeek：系统、用户模拟器和 Judge 显式共用
-`ANTHROPIC_API_KEY` 中的 DeepSeek 凭证，用户/Judge 默认 `deepseek/${ANTHROPIC_MODEL}`。
+当前页面服务的默认流程针对 DeepSeek。需要在 `.env` 中显式配置
+`ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` 和 `ANTHROPIC_MODEL`；模型名应为账号可用值。
+`evaluation/web.py` 启动时将 `ANTHROPIC_API_KEY` 复制到 `DEEPSEEK_API_KEY`，
+配置接口直接读取 `ANTHROPIC_MODEL`，用户/Judge 默认模型为 `deepseek/<ANTHROPIC_MODEL>`。
+缺少模型变量会导致页面配置请求失败；仅配置官方 Anthropic Key 不满足这套默认流程。
 页面默认模型从容器实际配置读取，不用宿主机的同名变量插值。
-页面可以指定用户/Judge 模型，使用的供应商凭证必须已在服务端配置；不会自动更换模型或供应商。
+
+使用其他供应商时，在 `.env` 配置该供应商供 LiteLLM 使用的凭证，并在页面中显式填写
+对应的用户/Judge 模型（含供应商前缀）。EchoMind 的系统模型仍由 `ANTHROPIC_*` 配置，
+必须使用 Anthropic 兼容接口。当前页面服务会覆盖 `DEEPSEEK_API_KEY`；若需让系统模型和
+DeepSeek 用户/Judge 使用不同凭证，请使用下方独立 CLI，或先调整 `evaluation/web.py` 的启动配置。
+
+修改 `.env` 后，在没有运行中实验时重新创建服务，使模型和凭证更新生效：
+
+```bash
+docker compose up -d --no-deps --force-recreate tau-eval echomind
+```
 
 ### 命令行运行
 

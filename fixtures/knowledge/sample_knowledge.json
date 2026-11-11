@@ -1,0 +1,6 @@
+[
+  {
+    "title": "EchoMind API 接入演示",
+    "content": "EchoMind API 接入步骤：先调用 GET /health 确认服务就绪，再向 POST /chat 发送 JSON。message 为必填字段；多轮对话使用相同的 user_id 和 conv_id。同一条消息重试时沿用 client_request_id，新消息使用新的 client_request_id。接口文档位于 /docs。"
+  }
+]
