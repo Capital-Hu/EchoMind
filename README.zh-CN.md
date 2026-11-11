@@ -87,7 +87,7 @@ docker compose build evaluation
 docker compose run --rm evaluation --split test --plan-only
 ```
 
-独立 CLI 需要为用户模拟器和 Judge 单独配置供应商凭证，不会自动复用主应用的 Key。配置、判分、测试与历史接入记录见[评测指南](evaluation/README.md)。已记录的运行是训练题接入验证，不是完整测试集成绩。
+独立 CLI 需要为用户模拟器和 Judge 单独配置供应商凭证，不会自动复用主应用的 Key。配置、判分、测试与历史接入记录见[评测指南](evaluation/README.md)。官方 40 道测试题各运行 1 次，通过 36 题（pass^1 = 0.90），系统、用户模拟器和 Judge 均为 `deepseek-flash`；运行目录与失败题见评测指南。
 
 ## 文档
 

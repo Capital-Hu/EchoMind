@@ -87,7 +87,7 @@ docker compose build evaluation
 docker compose run --rm evaluation --split test --plan-only
 ```
 
-The standalone CLI requires separate provider credentials for its user simulator and Judge; it does not automatically reuse the main application's key. See the [evaluation guide (Chinese)](evaluation/README.md) for configuration, scoring, tests, and recorded integration runs. Those runs are training-task checks, not a full test-set benchmark result.
+The standalone CLI requires separate provider credentials for its user simulator and Judge; it does not automatically reuse the main application's key. See the [evaluation guide (Chinese)](evaluation/README.md) for configuration, scoring, tests, and recorded integration runs. A single-trial run of the 40 official test tasks passed 36 (pass^1 = 0.90) with `deepseek-flash` as system, user simulator, and Judge; the guide records the run directories and failed tasks.
 
 ## Documentation
 

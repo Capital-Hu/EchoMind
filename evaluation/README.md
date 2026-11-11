@@ -123,7 +123,7 @@ Compose 会启动真实 Redis 和 Chroma；未运行 Docker 或依赖不可达�
 | 0 | 身份验证、商品选择、确认后一次申请两件换货 | DB=1，reward=1；无 NL 断言 | `20261106T190048Z-5267c02e` |
 | 2 | 查询商品规格、定位订单、确认退货，并回答可售 T 恤数量 | DB=1，NL=1，reward=1 | `20261106T190255Z-6f4ad0e9` |
 
-这是两道训练题的接入验证，未运行完整 40 题 test，不作为正式 benchmark 成绩。
+这是两道训练题的接入验证，不作为正式 benchmark 成绩；完整 40 题 test 的结果见文末「测试集运行记录」。
 存储复核：两题分别写入 4/5 个 Redis key、1/1 条 Chroma 用户画像、24/32 个 checkpoint；
 两题实际 RetailDB 快照均与官方严格重放完全一致，详见各题 `storage_verification.json`。
 两题对话都未触发摘要压缩，因此没有验证情景记忆归档或长期记忆收益。
@@ -156,3 +156,50 @@ docker compose run --rm --no-deps --entrypoint python evaluation -m unittest eva
 已验证 train/test/base 分别加载 74/40/114 题，刷新保持同一次运行，重复提交返回 409。
 另一次有意点击停止的实验 `20261106T195855Z-ca18c10b` 记录为 1 题已停止、1 题未运行，
 没有默认分数或 pass^k。8 项任务控制测试覆盖输入校验、模型配置、进程崩溃、超时回收和重启中断。
+
+## 测试集运行记录（2026-11-11）
+
+官方 test 划分 40 题，每题 1 次；系统、用户模拟器和 Judge 均为 `deepseek-flash`
+（用户/Judge 通过 LiteLLM 的 `deepseek/deepseek-flash` 调用），预算为默认值。
+
+| 项目 | 结果 |
+| --- | --- |
+| 计划 / 完成 | 40 / 40 |
+| 通过（reward=1） | 36 |
+| 失败（reward=0） | 4 |
+| 执行错误 | 0 |
+| pass^1 | 36/40 = 0.90 |
+
+运行分两次完成，合并后覆盖全部 40 题，没有题目重复计分：
+
+- `20261111T035025Z-eb47dc0a`：按整个题集启动，完成 6 题（5、9、12、17、18、26）后手动停止，
+  第 7 题（27）被中断、未计分；该目录的 `pass_hat_k` 为 null。
+- `20261111T041105Z-e208899d`：用 `--task-id` 补跑其余 34 题（含被中断的 27），
+  34 题全部完成，通过 31 题，该目录的 `pass_hat_k` 为 0.912。
+
+因此 0.90 是两个目录按题合并后的人工汇总，不是单次运行直接产出的 `pass_hat_k`；
+每题只有 1 次，没有 pass^2 及以上的数据。
+EchoMind 一侧 40 题合计约 140 万输入、91 万输出 tokens（各题 `system_usage` 之和），
+不含用户模拟器与 Judge。
+
+补跑命令（复用现有 DeepSeek 凭证，未修改 `.env`）：
+
+```bash
+docker compose run --rm --entrypoint sh evaluation -c \
+  'export DEEPSEEK_API_KEY="$ANTHROPIC_API_KEY"; python -m evaluation.run --split test --task-id 27 --task-id 32 ... --task-id 111 --trials 1 --user-model deepseek/deepseek-flash --judge-model deepseek/deepseek-flash'
+```
+
+### 失败题
+
+四题均为对话正常结束（`user_stop`）、DB 终态与官方参考不一致（DB=0）：
+
+| task | 场景 | 不一致之处 | 归因 |
+| --- | --- | --- | --- |
+| 5 | 换水杯和台灯 | 用户只提供用户名和邮编，Agent 坚持要求邮箱或「姓名 + 邮编」，用户放弃，未调用任何工具 | Agent 未从用户名 `mei_kovacs_8020` 推断姓名后查询 |
+| 38 | 额度不足，最终取消订单 | 取消原因为 `ordered by mistake`，参考为 `no longer needed` | 用户模拟器在对话中明确要求使用 `ordered by mistake`，Agent 照做 |
+| 74 | 笔记本换 i9 配置并取消另一单 | 换货差价退回订单原 PayPal，参考为信用卡 | Agent 默认使用原支付方式，没有询问差价的支付方式 |
+| 100 | 换行李箱和滑板、退登山靴 | 多执行一次 `modify_pending_order_payment`；滑板新款为塑料板面，参考为另一款 | Agent 把「差价用信用卡」理解为修改订单支付方式；未沿用原商品的未提及属性，改由用户选择 |
+
+可归纳为两类：差价支付方式的处理（74、100），以及用户信息不完整时不做默认推断（5、100）。
+task 38 取决于模拟器的措辞，重复运行结果可能不同。
+
